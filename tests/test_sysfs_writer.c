@@ -26,7 +26,7 @@ TEST(test_read_known_file) {
         ASSERT_PASS("read /proc/cpuinfo successfully");
     } else {
         printf("SKIP (/proc/cpuinfo not readable)\n");
-        tests_run++;  /* Don't count as failure */
+        tests_run++;
     }
 }
 
@@ -39,6 +39,18 @@ TEST(test_read_nonexistent) {
         free(val);
         printf("FAIL (should return NULL for nonexistent path)\n");
         tests_failed++;
+    }
+}
+
+/* Test sysfs_reader_read on /proc/self/oom_score_adj (writable by user) */
+TEST(test_read_proc_self) {
+    char *val = sysfs_reader_read("/proc/self/oom_score_adj");
+    if (val) {
+        free(val);
+        ASSERT_PASS("read /proc/self/oom_score_adj successfully");
+    } else {
+        printf("SKIP (/proc/self/oom_score_adj not readable)\n");
+        tests_run++;
     }
 }
 
@@ -58,6 +70,22 @@ TEST(test_writer_lifecycle) {
     ASSERT_PASS("writer create and destroy");
 }
 
+/* Test sysfs_writer with batching enabled */
+TEST(test_writer_with_batching) {
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.sysfs.nr_knobs = 0;
+
+    SysfsWriter *w = sysfs_writer_new(&cfg, 1000000);  /* 1ms batch window */
+    if (!w) {
+        printf("FAIL (sysfs_writer_new with batching returned NULL)\n");
+        tests_failed++;
+        return;
+    }
+    sysfs_writer_free(w);
+    ASSERT_PASS("writer with batching created and destroyed");
+}
+
 /* Test queueing a raw write to a writable path */
 TEST(test_queue_raw_write) {
     Config cfg;
@@ -68,10 +96,69 @@ TEST(test_queue_raw_write) {
     if (!w) { printf("SKIP (writer creation failed)\n"); tests_run++; return; }
 
     int ret = sysfs_writer_queue_raw(w, "/proc/self/oom_score_adj", "0");
-    /* This should succeed (queuing doesn't require the path to exist) */
     (void)ret;
     sysfs_writer_free(w);
     ASSERT_PASS("queue raw write");
+}
+
+/* Test flush on empty writer */
+TEST(test_flush_empty) {
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.sysfs.nr_knobs = 0;
+
+    SysfsWriter *w = sysfs_writer_new(&cfg, 0);
+    if (!w) { printf("SKIP (writer creation failed)\n"); tests_run++; return; }
+
+    sysfs_writer_flush(w);
+    sysfs_writer_free(w);
+    ASSERT_PASS("flush on empty writer succeeds");
+}
+
+/* Test queueing to a nonexistent path (should warn, not crash) */
+TEST(test_queue_nonexistent_path) {
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.sysfs.nr_knobs = 0;
+
+    SysfsWriter *w = sysfs_writer_new(&cfg, 0);
+    if (!w) { printf("SKIP (writer creation failed)\n"); tests_run++; return; }
+
+    /* Queue a write to a nonexistent path — should not crash */
+    sysfs_writer_queue_raw(w, "/sys/nonexistent/knob", "1");
+    sysfs_writer_flush(w);
+    sysfs_writer_free(w);
+    ASSERT_PASS("queue nonexistent path does not crash");
+}
+
+/* Test sysfs_reader_read on /sys/class/drm (if available) */
+TEST(test_read_sysfs) {
+    char *val = sysfs_reader_read("/sys/class/drm/card0/device/vendor");
+    if (val) {
+        free(val);
+        ASSERT_PASS("read /sys/class/drm vendor successfully");
+    } else {
+        printf("SKIP (drm sysfs not available)\n");
+        tests_run++;
+    }
+}
+
+/* Test reader returns trimmed value */
+TEST(test_reader_trims_newline) {
+    char *val = sysfs_reader_read("/proc/self/comm");
+    if (val) {
+        /* Should not contain newline */
+        if (strchr(val, '\n') == NULL) {
+            ASSERT_PASS("reader trims trailing newline");
+        } else {
+            printf("FAIL (value contains newline)\n");
+            tests_failed++;
+        }
+        free(val);
+    } else {
+        printf("SKIP (/proc/self/comm not readable)\n");
+        tests_run++;
+    }
 }
 
 int main(void) {
@@ -80,8 +167,14 @@ int main(void) {
 
     RUN_TEST(test_read_known_file);
     RUN_TEST(test_read_nonexistent);
+    RUN_TEST(test_read_proc_self);
     RUN_TEST(test_writer_lifecycle);
+    RUN_TEST(test_writer_with_batching);
     RUN_TEST(test_queue_raw_write);
+    RUN_TEST(test_flush_empty);
+    RUN_TEST(test_queue_nonexistent_path);
+    RUN_TEST(test_read_sysfs);
+    RUN_TEST(test_reader_trims_newline);
 
     printf("\nResults: %d/%d passed (%d failed)\n",
            tests_passed, tests_run, tests_failed);

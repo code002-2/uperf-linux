@@ -137,6 +137,126 @@ TEST(test_boost_not_needed) {
     ASSERT_PASS("no boost when load < threshold");
 }
 
+TEST(test_timeout_from_trigger_to_touch) {
+    Config *cfg = make_test_config();
+    StateMachine *sm = state_machine_new(cfg);
+    free(cfg);
+
+    state_machine_feed_event(sm, EVT_TOUCH_DOWN);
+    state_machine_feed_event(sm, EVT_TOUCH_UP);  /* trigger */
+    state_machine_feed_event(sm, EVT_TIMEOUT);
+    ASSERT_EQ((int)state_machine_get_scene(sm), SCENE_TOUCH, "timeout to touch");
+    ASSERT_PASS("trigger -> touch on timeout");
+}
+
+TEST(test_timeout_from_gesture_to_touch) {
+    Config *cfg = make_test_config();
+    StateMachine *sm = state_machine_new(cfg);
+    free(cfg);
+
+    state_machine_feed_event(sm, EVT_TOUCH_DOWN);
+    state_machine_feed_event(sm, EVT_GESTURE);
+    state_machine_feed_event(sm, EVT_TIMEOUT);
+    ASSERT_EQ((int)state_machine_get_scene(sm), SCENE_TOUCH, "timeout to touch");
+    ASSERT_PASS("gesture -> touch on timeout");
+}
+
+TEST(test_timeout_from_switch_to_touch) {
+    Config *cfg = make_test_config();
+    StateMachine *sm = state_machine_new(cfg);
+    free(cfg);
+
+    state_machine_feed_event(sm, EVT_WINDOW_SWITCH);
+    state_machine_feed_event(sm, EVT_TIMEOUT);
+    ASSERT_EQ((int)state_machine_get_scene(sm), SCENE_TOUCH, "timeout to touch");
+    ASSERT_PASS("switch -> touch on timeout");
+}
+
+TEST(test_boost_to_touch_on_heavy_end) {
+    Config *cfg = make_test_config();
+    StateMachine *sm = state_machine_new(cfg);
+    free(cfg);
+
+    state_machine_feed_event(sm, EVT_HEAVY_LOAD_START);
+    ASSERT_EQ((int)state_machine_get_scene(sm), SCENE_BOOST, "entered boost");
+
+    state_machine_feed_event(sm, EVT_HEAVY_LOAD_END);
+    ASSERT_EQ((int)state_machine_get_scene(sm), SCENE_TOUCH, "boost -> touch");
+    ASSERT_PASS("boost exits to touch on heavy load end");
+}
+
+TEST(test_boost_to_idle_on_timeout) {
+    Config *cfg = make_test_config();
+    StateMachine *sm = state_machine_new(cfg);
+    free(cfg);
+
+    state_machine_feed_event(sm, EVT_HEAVY_LOAD_START);
+    state_machine_feed_event(sm, EVT_TIMEOUT);
+    ASSERT_EQ((int)state_machine_get_scene(sm), SCENE_IDLE, "boost -> idle");
+    ASSERT_PASS("boost -> idle on timeout");
+}
+
+TEST(test_junk_from_touch) {
+    Config *cfg = make_test_config();
+    StateMachine *sm = state_machine_new(cfg);
+    free(cfg);
+
+    state_machine_feed_event(sm, EVT_TOUCH_DOWN);
+    SceneState s = state_machine_feed_event(sm, EVT_JUNK);
+    ASSERT_EQ((int)s, SCENE_JUNK, "junk transition");
+    ASSERT_PASS("touch -> junk on junk event");
+}
+
+TEST(test_junk_to_touch_on_timeout) {
+    Config *cfg = make_test_config();
+    StateMachine *sm = state_machine_new(cfg);
+    free(cfg);
+
+    state_machine_feed_event(sm, EVT_TOUCH_DOWN);
+    state_machine_feed_event(sm, EVT_JUNK);
+    state_machine_feed_event(sm, EVT_TIMEOUT);
+    ASSERT_EQ((int)state_machine_get_scene(sm), SCENE_TOUCH, "junk -> touch");
+    ASSERT_PASS("junk -> touch on timeout");
+}
+
+TEST(test_multiple_mode_changes) {
+    Config *cfg = make_test_config();
+    StateMachine *sm = state_machine_new(cfg);
+    free(cfg);
+
+    state_machine_set_mode(sm, MODE_POWERSAVE);
+    ASSERT_EQ((int)state_machine_get_mode(sm), MODE_POWERSAVE, "powersave mode");
+
+    state_machine_set_mode(sm, MODE_PERFORMANCE);
+    ASSERT_EQ((int)state_machine_get_mode(sm), MODE_PERFORMANCE, "performance mode");
+
+    state_machine_set_mode(sm, MODE_BALANCE);
+    ASSERT_EQ((int)state_machine_get_mode(sm), MODE_BALANCE, "balance mode");
+    ASSERT_PASS("multiple mode changes work correctly");
+}
+
+TEST(test_get_hint_duration) {
+    Config *cfg = make_test_config();
+    StateMachine *sm = state_machine_new(cfg);
+    free(cfg);
+
+    float d = state_machine_get_hint_duration(sm, SCENE_TOUCH);
+    ASSERT_GT(d, 0.0f, "touch hint duration > 0");
+    ASSERT_PASS("hint duration retrievable");
+}
+
+TEST(test_get_actions) {
+    Config *cfg = make_test_config();
+    StateMachine *sm = state_machine_new(cfg);
+    free(cfg);
+
+    ActionParams params;
+    state_machine_get_actions(sm, &params);
+    /* Should return at least the initial defaults */
+    ASSERT_GT(params.latency_time, 0.0f, "latency_time set");
+    ASSERT_PASS("actions retrievable with defaults");
+}
+
 int main(void) {
     printf("=== state_machine tests ===\n");
     log_init(LOG_WARN, 0, NULL);
@@ -150,6 +270,16 @@ int main(void) {
     RUN_TEST(test_mode_change);
     RUN_TEST(test_boost_detection);
     RUN_TEST(test_boost_not_needed);
+    RUN_TEST(test_timeout_from_trigger_to_touch);
+    RUN_TEST(test_timeout_from_gesture_to_touch);
+    RUN_TEST(test_timeout_from_switch_to_touch);
+    RUN_TEST(test_boost_to_touch_on_heavy_end);
+    RUN_TEST(test_boost_to_idle_on_timeout);
+    RUN_TEST(test_junk_from_touch);
+    RUN_TEST(test_junk_to_touch_on_timeout);
+    RUN_TEST(test_multiple_mode_changes);
+    RUN_TEST(test_get_hint_duration);
+    RUN_TEST(test_get_actions);
 
     printf("\nResults: %d/%d passed (%d failed)\n",
            tests_passed, tests_run, tests_failed);

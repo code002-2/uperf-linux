@@ -118,6 +118,12 @@ if(BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/include
     )
     target_link_libraries(test_sysfs_writer PRIVATE pthread)
+
+    add_executable(test_game_scanner tests/test_game_scanner.c src/log.c src/game_scanner.c)
+    target_include_directories(test_game_scanner PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/include
+    )
+    target_link_libraries(test_game_scanner PRIVATE pthread)
 endif()
 
 # ---- Qt6 GUI ----
