@@ -1,0 +1,3 @@
+upstream-version: 0.1.0
+severity: low
+stop-on-failure: false

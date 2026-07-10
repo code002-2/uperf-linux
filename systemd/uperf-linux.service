@@ -1,6 +1,6 @@
 [Unit]
 Description=Uperf-Linux Userspace Performance Scheduler
-Documentation=https://github.com/user/uperf-linux
+Documentation=https://github.com/code002-2/uperf-linux
 After=multi-user.target
 Wants=network-online.target
 
@@ -14,7 +14,7 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=uperf-linux
 
-# Runtime directory for state files
+# Runtime directory for state files and DBus socket
 RuntimeDirectory=uperf-linux
 StateDirectory=uperf-linux
 
@@ -31,6 +31,9 @@ Slice=system.slice
 # Required capabilities
 CapabilityBoundingSet=CAP_SYS_NICE CAP_SYS_RESOURCE CAP_DAC_OVERRIDE CAP_BLOCK_SUSPEND
 AmbientCapabilities=CAP_SYS_NICE CAP_SYS_RESOURCE CAP_DAC_OVERRIDE CAP_BLOCK_SUSPEND
+
+# DBus activation
+BusName=org.uperflinux.Daemon
 
 [Install]
 WantedBy=multi-user.target

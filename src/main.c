@@ -8,6 +8,7 @@
 #include "heavyload_detector.h"
 #include "power_model.h"
 #include "game_scanner.h"
+#include "dbus_interface.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +27,7 @@ static SysfsWriter *g_writer = NULL;
 static CgroupManager *g_cm = NULL;
 static HeavyLoadDetector *g_detector = NULL;
 static GameScanner *g_scanner = NULL;
+static DbusManager *g_dbus = NULL;
 static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_reload_config = 0;
 
@@ -112,6 +114,30 @@ static int event_loop(void) {
         /* Sample heavy load */
         if (g_detector) {
             float load = heavyload_detector_sample(g_detector);
+
+            /* Update DBus with current stats */
+            if (g_dbus) {
+                /* Collect per-CPU frequencies */
+                double freqs[8] = {0};
+                double loads[8] = {0};
+                int nr = 0;
+                for (int cpu = 0; cpu < 8; cpu++) {
+                    char path[MAX_PATH_LEN];
+                    snprintf(path, sizeof(path),
+                             "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", cpu);
+                    char *val = sysfs_reader_read(path);
+                    if (val) {
+                        freqs[nr] = atof(val) / 1000.0;  /* kHz → MHz */
+                        free(val);
+                    }
+                    loads[nr] = load;
+                    nr++;
+                }
+                dbus_manager_update_frequencies(g_dbus, freqs, nr);
+                dbus_manager_update_loads(g_dbus, loads, nr);
+                dbus_manager_set_heavy_load(g_dbus,
+                    heavyload_detector_is_heavy(g_detector) ? TRUE : FALSE);
+            }
 
             /* Check if we need to boost */
             if (g_sm && heavyload_detector_is_heavy(g_detector)) {
@@ -284,6 +310,23 @@ int main(int argc, char *argv[]) {
         game_scanner_scan(g_scanner);
     }
 
+    /* Initialize DBus manager */
+    g_dbus = dbus_manager_new(G_BUS_TYPE_SYSTEM);
+    if (g_dbus) {
+        /* Wire up the mode handler */
+        dbus_manager_set_mode_handler(g_dbus,
+            [](const char *mode, void *ud) {
+                (void)ud;
+                (void)mode;
+                /* TODO: call state_machine_set_mode(g_sm, mode_from_string(mode)) */
+                log_info("DBus requested mode change to: %s", mode);
+            },
+            NULL);
+        log_info("DBus manager initialized on system bus");
+    } else {
+        log_warn("Failed to initialize DBus manager (GUI will not be able to control daemon)");
+    }
+
     /* Apply initial state */
     apply_initial_state();
 
@@ -292,6 +335,7 @@ int main(int argc, char *argv[]) {
 
     /* Cleanup */
     log_info("Shutting down...");
+    dbus_manager_free(g_dbus);
     game_scanner_free(g_scanner);
     input_monitor_free(g_im);
     heavyload_detector_free(g_detector);

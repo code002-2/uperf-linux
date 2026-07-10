@@ -5,7 +5,7 @@
 
 ## Overview
 
-`uperf-linux` is a systemd-managed daemon that provides fine-grained CPU/GPU scheduling
+`uperf-linux` is a systemd-managed daemon with a Qt6/QML GUI that provides fine-grained CPU/GPU scheduling
 for gaming on Linux ARM64 devices. It borrows the core design philosophy from Uperf-Game-Turbo:
 
 - **JSON-config-driven** sysfs knob writing (cpufreq, devfreq, uClamp)
@@ -37,6 +37,34 @@ Unlike the Android original, this runs on **standard Linux** (no Magisk, no AOSP
 │  HeavyLoad    ←→ /proc/stat polling                          │
 │  GameScanner  ←→ /proc/*/comm + /proc/*/cmdline matching     │
 └──────────────────────────────────────────────────────────────┘
+```
+
+## GUI (Qt6/QML)
+
+A tablet-friendly Qt6/QML graphical controller communicates with the daemon over **DBus**:
+
+```bash
+# Launch the GUI
+uperf-gui
+```
+
+### Features
+- **Dashboard**: Power mode buttons, real-time CPU frequency chart, load meters, scene indicator
+- **Games**: Detected game process list with per-app mode assignment
+- **Settings**: Threshold sliders (HeavyLoad, sample time, margin, burst)
+- **Logs**: Live daemon log viewer
+
+### DBus Interface
+The daemon exposes `org.uperflinux.Daemon` on the system bus:
+```bash
+# Query current mode
+dbus-send --system --dest=org.uperflinux.Daemon --print-reply \
+  /org/uperflinux/Daemon org.freedesktop.DBus.Properties.Get \
+  string:'org.uperflinux.Daemon' string:'CurrentMode'
+
+# Set mode
+dbus-send --system --dest=org.uperflinux.Daemon --print-reply \
+  /org/uperflinux/Daemon org.uperflinux.Daemon.SetMode string:'performance'
 ```
 
 ## Supported Platforms
@@ -82,6 +110,17 @@ sudo mkdir -p /run/uperf-linux
 sudo cp ../systemd/uperf-linux.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now uperf-linux.service
+
+# GUI (requires Qt6)
+sudo cp uperf-gui /usr/local/bin/
+sudo desktop-file-install gui/uperf-gui.desktop
+```
+
+### Install from deb
+
+```bash
+sudo dpkg -i uperf-linux-gui_0.1.0_arm64.deb
+sudo systemctl enable --now uperf-linux
 ```
 
 ### Usage
@@ -181,9 +220,11 @@ MIT License (same as the original uperf project's Apache 2.0 spirit — adapt as
 - [x] SM8550 config
 - [x] CLI tool (uperfctl)
 - [x] systemd service unit
+- [x] DBus interface (org.uperflinux.Daemon)
+- [x] Qt6/QML GUI (Dashboard, Games, Settings, Logs)
+- [x] deb packaging (dpkg-deb)
 - [ ] Unit tests (expand test coverage)
 - [ ] Thermal awareness (read /sys/class/thermal/)
 - [ ] DRM/Modesetting hook (Linux equivalent of SfAnalysis)
-- [ ] DBus interface for remote control
 - [ ] Per-app power mode auto-switching
 - [ ] Config generation wizard for new SoCs
