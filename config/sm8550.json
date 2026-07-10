@@ -1,0 +1,253 @@
+{
+  "meta": {
+    "name": "sm8550 [2026.07]",
+    "author": "uperf-linux contributors"
+  },
+
+  "modules": {
+    "switcher": {
+      "switchInode": "/run/uperf-linux/cur_powermode",
+      "perapp": "/etc/uperf-linux/perapp_powermode",
+      "hintDuration": {
+        "idle": 0.0,
+        "touch": 4.0,
+        "trigger": 0.03,
+        "gesture": 0.1,
+        "junk": 0.06,
+        "switch": 0.4,
+        "boost": 0.0
+      }
+    },
+
+    "input": {
+      "enable": true,
+      "swipeThd": 0.03,
+      "gestureThdX": 0.03,
+      "gestureThdY": 0.03,
+      "gestureDelayTime": 2.0,
+      "holdEnterTime": 1.0
+    },
+
+    "cpu": {
+      "enable": true,
+      "powerModel": [
+        {
+          "efficiency": 350,
+          "nr": 1,
+          "typicalPower": 1.2,
+          "typicalFreq": 2400,
+          "sweetFreq": 1800,
+          "plainFreq": 1400,
+          "freeFreq": 600
+        },
+        {
+          "efficiency": 280,
+          "nr": 2,
+          "typicalPower": 1.5,
+          "typicalFreq": 2200,
+          "sweetFreq": 1600,
+          "plainFreq": 1200,
+          "freeFreq": 500
+        },
+        {
+          "efficiency": 180,
+          "nr": 5,
+          "typicalPower": 0.8,
+          "typicalFreq": 1600,
+          "sweetFreq": 1000,
+          "plainFreq": 700,
+          "freeFreq": 300
+        }
+      ]
+    },
+
+    "sysfs": {
+      "enable": true,
+      "knob": {
+        "cpufreqMax": "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq",
+        "cpufreqMin": "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_min_freq",
+        "cpufreqGovernor": "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor",
+        "gpuMaxFreq": "/sys/class/devfreq/soc\\:qcom\\:gpu/max_freq",
+        "gpuMinFreq": "/sys/class/devfreq/soc\\:qcom\\:gpu/min_freq",
+        "gpuGovernor": "/sys/class/devfreq/soc\\:qcom\\:gpu/governor",
+        "memBwMax": "/sys/class/devfreq/soc\\:qcom\\:cpu-cpu-llcc-bw/max_freq",
+        "socMaxFreq": "/sys/class/devfreq/soc\\:qcom\\:soc/max_freq"
+      }
+    },
+
+    "sched": {
+      "enable": true,
+      "cpumask": {
+        "all": [0,1,2,3,4,5,6,7],
+        "prime": [0],
+        "performance": [1,2],
+        "efficiency": [3,4,5,6,7]
+      },
+      "affinity": {
+        "auto":  { "bg": "", "fg": "", "idle": "", "touch": "", "boost": "" },
+        "norm":  { "bg": "", "fg": "all", "idle": "all", "touch": "all", "boost": "all" },
+        "bg":    { "bg": "", "fg": "efficiency", "idle": "efficiency", "touch": "efficiency", "boost": "efficiency" },
+        "ui":    { "bg": "", "fg": "all", "idle": "all", "touch": "performance", "boost": "all" },
+        "crit":  { "bg": "", "fg": "all", "idle": "all", "touch": "prime", "boost": "prime" },
+        "gtcoop":{ "bg": "", "fg": "all", "idle": "all", "touch": "performance", "boost": "all" },
+        "gtmain":{ "bg": "", "fg": "all", "idle": "all", "touch": "prime", "boost": "prime" }
+      },
+      "prio": {
+        "auto":  { "bg": 0, "fg": 0, "idle": 0, "touch": 0, "boost": 0 },
+        "bg":    { "bg": -3, "fg": 139, "idle": 139, "touch": 139, "boost": 139 },
+        "norm":  { "bg": -1, "fg": -1, "idle": 120, "touch": 120, "boost": 130 },
+        "coop":  { "bg": -3, "fg": 124, "idle": 122, "touch": 122, "boost": 130 },
+        "ui":    { "bg": -3, "fg": 120, "idle": 110, "touch": 98, "boost": 116 },
+        "rtusr": { "bg": 98, "fg": 98, "idle": 97, "touch": 97, "boost": 98 }
+      },
+      "rules": [
+        {
+          "name": "Display server / WM",
+          "regex": "gnome-shell|kwin_wayland|sway|weston-launch|xwayland|Xorg",
+          "pinned": true,
+          "rules": [{"k": ".*", "ac": "ui", "pc": "rtusr"}]
+        },
+        {
+          "name": "Game engine main thread",
+          "regex": "^(UnityMain|GameThread|RenderThread|GLThread|GLESThread)",
+          "pinned": true,
+          "rules": [{"k": ".*", "ac": "gtmain", "pc": "auto"}]
+        },
+        {
+          "name": "Game worker threads",
+          "regex": "^(Worker|TaskGraph|RHIThread|Job|ThreadPool|Async|IOThread)",
+          "pinned": false,
+          "rules": [{"k": ".*", "ac": "gtcoop", "pc": "auto"}]
+        },
+        {
+          "name": "Browser renderer",
+          "regex": "^(CrRendererMain|Compositor|Viz|gpu-compute|gpu-sandbox)",
+          "pinned": false,
+          "rules": [{"k": ".*", "ac": "ui", "pc": "ui"}]
+        },
+        {
+          "name": "Background threads",
+          "regex": "^(Jit|HeapTask|Finalizer|ReferenceQueue|GC|pool-|glide-|launcher-|Fresco|Download)",
+          "pinned": false,
+          "rules": [{"k": ".*", "ac": "bg", "pc": "auto"}]
+        },
+        {
+          "name": "Default",
+          "regex": ".*",
+          "pinned": false,
+          "rules": [{"k": ".*", "ac": "norm", "pc": "auto"}]
+        }
+      ]
+    }
+  },
+
+  "initials": {
+    "cpu": {
+      "baseSampleTime": 0.01,
+      "baseSlackTime": 0.01,
+      "latencyTime": 0.2,
+      "slowLimitPower": 3.0,
+      "fastLimitPower": 6.0,
+      "fastLimitCapacity": 10.0,
+      "fastLimitRecoverScale": 0.3,
+      "predictThd": 0.3,
+      "margin": 0.25,
+      "burst": 0.0,
+      "guideCap": false,
+      "limitEfficiency": false
+    },
+    "sysfs": {
+      "cpufreqMax": "9999000",
+      "cpufreqMin": "0",
+      "gpuMaxFreq": "999900000",
+      "gpuMinFreq": "0"
+    },
+    "sched": {
+      "scene": "idle"
+    }
+  },
+
+  "presets": {
+    "balance": {
+      "*": {
+        "cpu.latencyTime": 0.2,
+        "cpu.slowLimitPower": 2.0,
+        "cpu.fastLimitPower": 2.0,
+        "cpu.fastLimitCapacity": 16.0,
+        "cpu.margin": 0.2
+      },
+      "idle": {
+        "cpu.baseSampleTime": 0.04,
+        "cpu.baseSlackTime": 0.08,
+        "cpu.predictThd": 0.3,
+        "cpu.limitEfficiency": true
+      },
+      "touch": {
+        "cpu.baseSampleTime": 0.04
+      },
+      "trigger": {
+        "cpu.latencyTime": 0.0,
+        "cpu.margin": 0.4
+      },
+      "gesture": {
+        "cpu.margin": 0.6
+      },
+      "junk": {
+        "cpu.burst": 0.6
+      },
+      "switch": {
+        "cpu.latencyTime": 0.0,
+        "cpu.slowLimitPower": 3.0,
+        "cpu.fastLimitPower": 5.0,
+        "cpu.fastLimitRecoverScale": 0.1,
+        "cpu.margin": 0.4
+      }
+    },
+
+    "powersave": {
+      "*": {
+        "cpu.latencyTime": 0.4,
+        "cpu.slowLimitPower": 1.0,
+        "cpu.fastLimitPower": 1.0,
+        "cpu.fastLimitCapacity": 4.0,
+        "cpu.margin": 0.1
+      },
+      "idle": {
+        "cpu.baseSampleTime": 0.04,
+        "cpu.baseSlackTime": 0.08,
+        "cpu.predictThd": 1.0,
+        "cpu.limitEfficiency": true
+      },
+      "touch": {
+        "cpu.baseSampleTime": 0.04
+      },
+      "switch": {
+        "cpu.latencyTime": 0.0,
+        "cpu.slowLimitPower": 1.5,
+        "cpu.fastLimitPower": 2.5,
+        "cpu.fastLimitRecoverScale": 0.1,
+        "cpu.margin": 0.3
+      }
+    },
+
+    "performance": {
+      "*": {
+        "cpu.latencyTime": 0.0,
+        "cpu.slowLimitPower": 999.0,
+        "cpu.fastLimitPower": 999.0,
+        "cpu.fastLimitCapacity": 999.0,
+        "cpu.margin": 0.4,
+        "cpu.burst": 0.2
+      },
+      "idle": {
+      },
+      "touch": {
+        "cpu.margin": 0.4,
+        "cpu.latencyTime": 0.0
+      },
+      "switch": {
+        "cpu.burst": 0.2
+      }
+    }
+  }
+}

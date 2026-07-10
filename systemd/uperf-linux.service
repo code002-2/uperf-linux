@@ -1,0 +1,36 @@
+[Unit]
+Description=Uperf-Linux Userspace Performance Scheduler
+Documentation=https://github.com/user/uperf-linux
+After=multi-user.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/uperf-linux --config /etc/uperf-linux/config.json --journald
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=uperf-linux
+
+# Runtime directory for state files
+RuntimeDirectory=uperf-linux
+StateDirectory=uperf-linux
+
+# Security hardening
+NoNewPrivileges=no
+ProtectSystem=strict
+ReadWritePaths=/etc/uperf-linux /run/uperf-linux /var/log/uperf-linux
+ProtectHome=yes
+
+# cgroup delegation (needed for cgroup v2 management)
+Delegate=yes
+Slice=system.slice
+
+# Required capabilities
+CapabilityBoundingSet=CAP_SYS_NICE CAP_SYS_RESOURCE CAP_DAC_OVERRIDE CAP_BLOCK_SUSPEND
+AmbientCapabilities=CAP_SYS_NICE CAP_SYS_RESOURCE CAP_DAC_OVERRIDE CAP_BLOCK_SUSPEND
+
+[Install]
+WantedBy=multi-user.target
