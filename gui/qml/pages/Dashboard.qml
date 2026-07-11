@@ -234,56 +234,24 @@ Page {
                 anchors.margins: 16
                 spacing: 8
 
-                Repeater {
-                    model: 4  /* Up to 4 thermal zones */
-                    Rectangle {
-                        Layout.fillWidth: true
-                        height: 36
-                        radius: 8
-                        color: "#16213e"
-
-                        RowLayout {
-                            anchors.fill: parent
-                            anchors.margins: 8
-                            spacing: 12
-
-                            Label {
-                                text: "Zone " + (modelIndex + 1)
-                                color: "#a0a0b0"
-                                font.pixelSize: 14
-                                Layout.fillWidth: true
-                            }
-
-                            Label {
-                                text: root.modeProxy.maxTemp > 0 ?
-                                    (root.modeProxy.maxTemp / 1000) + "." +
-                                    String(root.modeProxy.maxTemp % 1000).padStart(3, '0') + "°C" :
-                                    "--°C"
-                                font.pixelSize: 16
-                                font.bold: true
-                                color: {
-                                    var temp = root.modeProxy.maxTemp / 1000;
-                                    if (temp >= 80) return "#ff6b6b";
-                                    if (temp >= 70) return "#ffa500";
-                                    return "#4ecca3";
-                                }
-                            }
-
-                            Rectangle {
-                                Layout.preferredWidth: 60
-                                Layout.preferredHeight: 8
-                                radius: 4
-                                color: {
-                                    var temp = root.modeProxy.maxTemp / 1000;
-                                    if (temp >= 80) return "#ff6b6b";
-                                    if (temp >= 70) return "#ffa500";
-                                    return "#4ecca3";
-                                }
-                            }
-                        }
+                // Show max temp prominently
+                Label {
+                    text: "Max: " + (root.modeProxy.maxTemp > 0 ?
+                        (root.modeProxy.maxTemp / 1000) + "." +
+                        String(root.modeProxy.maxTemp % 1000).padStart(3, '0') + "°C" :
+                        "--°C")
+                    font.pixelSize: 20
+                    font.bold: true
+                    color: {
+                        var temp = root.modeProxy.maxTemp / 1000;
+                        if (temp >= 80) return "#ff6b6b";
+                        if (temp >= 70) return "#ffa500";
+                        return "#4ecca3";
                     }
+                    Layout.alignment: Qt.AlignHCenter
                 }
 
+                // Zone count indicator
                 Label {
                     text: "Thermal state: " + (root.modeProxy.thermalState || "NORMAL")
                     font.pixelSize: 14
@@ -291,6 +259,33 @@ Page {
                           root.modeProxy.thermalState === "THROTTLED" ? "#ffa500" :
                           root.modeProxy.thermalState === "WARNING" ? "#ffd700" : "#4ecca3"
                     Layout.alignment: Qt.AlignHCenter
+                }
+
+                // Progress bar for visual severity
+                ProgressBar {
+                    value: root.modeProxy.maxTemp > 0 ?
+                        Math.min(1.0, (root.modeProxy.maxTemp / 1000 - 40) / 60) : 0
+                    from: 0; to: 1
+                    Layout.fillWidth: true
+                    contentItem: Item {
+                        Rectangle {
+                            width: parent.width
+                            height: parent.height
+                            radius: 4
+                            color: "#16213e"
+                        }
+                        Rectangle {
+                            width: parent.width * parent.visualPosition
+                            height: parent.height
+                            radius: 4
+                            color: {
+                                var t = parent.parent.value;
+                                if (t >= 0.8) return "#ff6b6b";
+                                if (t >= 0.5) return "#ffa500";
+                                return "#4ecca3";
+                            }
+                        }
+                    }
                 }
             }
         }

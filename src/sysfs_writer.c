@@ -112,13 +112,14 @@ void sysfs_writer_flush(SysfsWriter *w) {
             ret = -1;
     }
 
+    int flushed = w->batch_len;
     w->batch_len = 0;
     clock_gettime(CLOCK_MONOTONIC, &w->last_flush);
 
     if (ret < 0)
         log_error("sysfs_writer_flush: some writes failed (see logs)");
     else
-        log_debug("sysfs_writer_flush: %d writes applied", w->batch_len);
+        log_debug("sysfs_writer_flush: %d writes applied", flushed);
 }
 
 void sysfs_writer_apply(const SysfsWriter *w, const ActionParams *params,

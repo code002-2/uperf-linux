@@ -34,7 +34,12 @@ static ThermalManager *g_thermal = NULL;
 static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_reload_config = 0;
 
-/* Signal handlers */
+/* DBus mode change handler */
+static void dbus_mode_handler(const char *mode, void *ud) {
+    (void)ud;
+    /* TODO: map mode string to PowerMode enum and call state_machine_set_mode */
+    log_info("DBus requested mode change to: %s", mode);
+}
 static void signal_handler(int sig) {
     if (sig == SIGINT || sig == SIGTERM || sig == SIGQUIT) {
         g_running = 0;
@@ -389,15 +394,7 @@ int main(int argc, char *argv[]) {
     /* Initialize DBus manager */
     g_dbus = dbus_manager_new(G_BUS_TYPE_SYSTEM);
     if (g_dbus) {
-        /* Wire up the mode handler */
-        dbus_manager_set_mode_handler(g_dbus,
-            [](const char *mode, void *ud) {
-                (void)ud;
-                (void)mode;
-                /* TODO: call state_machine_set_mode(g_sm, mode_from_string(mode)) */
-                log_info("DBus requested mode change to: %s", mode);
-            },
-            NULL);
+        dbus_manager_set_mode_handler(g_dbus, dbus_mode_handler, NULL);
         log_info("DBus manager initialized on system bus");
     } else {
         log_warn("Failed to initialize DBus manager (GUI will not be able to control daemon)");

@@ -164,15 +164,6 @@ int game_scanner_scan(GameScanner *gs) {
             strncpy(gp->package, cmdline, sizeof(gp->package) - 1);
             gp->package[sizeof(gp->package) - 1] = '\0';
 
-            /* Assign per-app mode if rules are loaded */
-            if (gs->perapp.nr_rules > 0) {
-                PowerMode pm = perapp_lookup(&gs->perapp, comm);
-                const char *mode_names[] = {"balance", "powersave", "performance", "fast", "balance"};
-                strncpy(gp->package, mode_names[pm], sizeof(gp->package) - 1);
-                log_debug("game_scanner: PID=%d comm='%s' → mode=%s",
-                          pid, comm, mode_names[pm]);
-            }
-
             gs->nr_processes++;
             log_debug("game_scanner: found game PID=%d comm=%s cmdline=%s",
                       pid, comm, cmdline);

@@ -137,6 +137,18 @@ if(BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/include
     )
     target_link_libraries(test_game_scanner PRIVATE pthread)
+
+    add_executable(test_perapp_config tests/test_perapp_config.c src/log.c src/perapp_config.c)
+    target_include_directories(test_perapp_config PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/include
+    )
+    target_link_libraries(test_perapp_config PRIVATE pthread)
+
+    add_executable(test_thermal tests/test_thermal.c src/log.c src/thermal.c)
+    target_include_directories(test_thermal PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/include
+    )
+    target_link_libraries(test_thermal PRIVATE pthread)
 endif()
 
 # ---- Qt6 GUI ----

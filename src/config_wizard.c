@@ -10,7 +10,16 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <sys/types.h>
+#include <linux/input.h>
 #include <errno.h>
+
+/* Bitops helpers for ioctl bitmasks */
+#define ABSBIT_WORDS (NBITS(EV_ABS) * NBITS(ABS_MAX))
+static inline int test_bit(int nr, const unsigned long *addr) {
+    return (addr[nr / (sizeof(unsigned long) * 8)] >> (nr % (sizeof(unsigned long) * 8))) & 1;
+}
 
 /* Simple JSON builder helpers — no external dependency */
 
@@ -88,60 +97,95 @@ static void detect_cpu_topology(FILE *fp) {
         goto cpu_done;
     }
 
-    /* Scan cpu0..cpuN to determine clusters */
+    /* Count total CPUs by walking cpu0..cpuN */
     for (int cpu = 0; cpu < 16; cpu++) {
         char path[256];
         snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d", cpu);
         struct stat st;
         if (stat(path, &st) != 0) break;  /* No more CPUs */
         total_cpus++;
-
-        /* Read scaling_driver to determine cluster membership */
-        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_driver", cpu);
-        char *driver = read_file(path);
-        if (!driver) continue;
-
-        /* Find or create cluster entry */
-        int cluster_idx = -1;
-        for (int c = 0; c < nr_clusters; c++) {
-            char key[128];
-            snprintf(key, sizeof(key), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_driver",
-                     cpu - (total_cpus - 1));
-            /* Simpler: use online_cpus file */
-            break;
-        }
-        free(driver);
-
-        /* Simpler approach: count total CPUs and assume 1+2+5 or 1+3+4 layout */
-        if (total_cpus == 8) {
-            clusters[0] = 1; clusters[1] = 2; clusters[2] = 5;
-            nr_clusters = 3;
-            typical_freqs[0] = 2400; typical_freqs[1] = 2200; typical_freqs[2] = 1600;
-            efficiencies[0] = 350; efficiencies[1] = 280; efficiencies[2] = 180;
-        } else if (total_cpus == 4) {
-            clusters[0] = 1; clusters[1] = 3;
-            nr_clusters = 2;
-            typical_freqs[0] = 2800; typical_freqs[1] = 2000;
-            efficiencies[0] = 400; efficiencies[1] = 200;
-        } else if (total_cpus == 6) {
-            clusters[0] = 1; clusters[1] = 1; clusters[2] = 4;
-            nr_clusters = 3;
-            typical_freqs[0] = 3000; typical_freqs[1] = 2400; typical_freqs[2] = 1800;
-            efficiencies[0] = 400; efficiencies[1] = 300; efficiencies[2] = 180;
-        } else if (total_cpus == 2) {
-            clusters[0] = 2;
-            nr_clusters = 1;
-            typical_freqs[0] = 2000;
-            efficiencies[0] = 200;
-        } else {
-            /* Generic: assume single cluster */
-            clusters[0] = total_cpus;
-            nr_clusters = 1;
-            typical_freqs[0] = 1800;
-            efficiencies[0] = 150;
-        }
     }
     closedir(cpu_dir);
+
+    /* Assume cluster layout based on total CPU count */
+    if (total_cpus == 8) {
+        clusters[0] = 1; clusters[1] = 2; clusters[2] = 5;
+        nr_clusters = 3;
+        typical_freqs[0] = 2400; typical_freqs[1] = 2200; typical_freqs[2] = 1600;
+        efficiencies[0] = 350; efficiencies[1] = 280; efficiencies[2] = 180;
+    } else if (total_cpus == 4) {
+        clusters[0] = 1; clusters[1] = 3;
+        nr_clusters = 2;
+        typical_freqs[0] = 2800; typical_freqs[1] = 2000;
+        efficiencies[0] = 400; efficiencies[1] = 200;
+    } else if (total_cpus == 6) {
+        clusters[0] = 1; clusters[1] = 1; clusters[2] = 4;
+        nr_clusters = 3;
+        typical_freqs[0] = 3000; typical_freqs[1] = 2400; typical_freqs[2] = 1800;
+        efficiencies[0] = 400; efficiencies[1] = 300; efficiencies[2] = 180;
+    } else if (total_cpus == 2) {
+        clusters[0] = 2;
+        nr_clusters = 1;
+        typical_freqs[0] = 2000;
+        efficiencies[0] = 200;
+    } else {
+        /* Generic: assume single cluster */
+        clusters[0] = total_cpus;
+        nr_clusters = 1;
+        typical_freqs[0] = 1800;
+        efficiencies[0] = 150;
+    }
+
+    /* Try to read actual max frequency from sysfs to refine defaults */
+    char freq_path[256];
+    snprintf(freq_path, sizeof(freq_path),
+             "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq");
+    char *max_freq_str = read_file(freq_path);
+    if (max_freq_str) {
+        int max_freq_khz = atoi(max_freq_str);
+        if (max_freq_khz > 0) {
+            float max_freq_mhz = max_freq_khz / 1000.0f;
+            /* Use actual max freq to scale cluster frequencies */
+            for (int c = 0; c < nr_clusters; c++) {
+                if (typical_freqs[c] == 0)
+                    typical_freqs[c] = max_freq_mhz * 0.7f;
+                if (efficiencies[c] == 0)
+                    efficiencies[c] = 150 + c * 80;
+            }
+        }
+        free(max_freq_str);
+    }
+
+    /* Read available frequencies from first CPU for more accuracy */
+    snprintf(freq_path, sizeof(freq_path),
+             "/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies");
+    char *avail_freqs = read_file(freq_path);
+    if (avail_freqs) {
+        /* Find the max available frequency */
+        int max_avail = 0, val;
+        char *tok = strtok(avail_freqs, " ");
+        while (tok) {
+            val = atoi(tok);
+            if (val > max_avail) max_avail = val;
+            tok = strtok(NULL, " ");
+        }
+        if (max_avail > 0) {
+            float max_avail_mhz = max_avail / 1000.0f;
+            /* If we got a real max from sysfs, use it to scale */
+            for (int c = 0; c < nr_clusters; c++) {
+                if (clusters[c] > 0) {
+                    /* Prime cluster gets full max, others scaled down */
+                    if (c == 0) {
+                        typical_freqs[c] = max_avail_mhz;
+                    } else {
+                        typical_freqs[c] = max_avail_mhz * (1.0f / (c + 1));
+                        if (typical_freqs[c] < 500) typical_freqs[c] = 500;
+                    }
+                }
+            }
+        }
+        free(avail_freqs);
+    }
 
     for (int c = 0; c < nr_clusters; c++) {
         if (c > 0) fprintf(fp, ",\n");
@@ -189,11 +233,36 @@ static void detect_devfreq(FILE *fp) {
             snprintf(path, sizeof(path), "/sys/class/devfreq/%s/max_freq", ent->d_name);
             if (access(path, F_OK) == 0) {
                 if (nr_devfreq > 0) fprintf(fp, ",\n");
-                /* Escape colons for JSON */
-                char escaped[128];
-                snprintf(escaped, sizeof(escaped), "soc\\:%s", ent->d_name + 3);
+                /* Escape colons in devfreq device names for sysfs path */
+                char escaped_name[128] = {0};
+                const char *src = ent->d_name;
+                char *dst = escaped_name;
+                while (*src && dst < escaped_name + sizeof(escaped_name) - 4) {
+                    if (*src == ':') {
+                        *dst++ = '\\';
+                        *dst++ = ':';
+                    } else {
+                        *dst++ = *src;
+                    }
+                    src++;
+                }
+                *dst = '\0';
+
+                /* Determine a meaningful knob name from the device name */
+                char knob_name[64] = {0};
+                if (strstr(ent->d_name, "gpu"))
+                    strcpy(knob_name, "gpuMaxFreq");
+                else if (strstr(ent->d_name, "cpu-cpu-llcc-bw"))
+                    strcpy(knob_name, "memBwMax");
+                else if (strstr(ent->d_name, "cpu-llcc-ddr-bw"))
+                    strcpy(knob_name, "ddrMaxFreq");
+                else if (strstr(ent->d_name, "soc"))
+                    strcpy(knob_name, "socMaxFreq");
+                else
+                    snprintf(knob_name, sizeof(knob_name), "%sFreq", ent->d_name);
+
                 fprintf(fp, "      \"%s\": \"/sys/class/devfreq/%s\"",
-                        ent->d_name, escaped);
+                        knob_name, escaped_name);
                 nr_devfreq++;
             }
         }
@@ -239,9 +308,11 @@ static void detect_thermal(FILE *fp) {
             char *temp = read_file(temp_path);
 
             if (!first) fprintf(fp, ",\n");
-            fprintf(fp, "      {\"id\": %s, \"type\": %s, \"temp_millidegC\": %s}",
-                    ent->d_name,
-                    type ? type : "\"unknown\"",
+            fprintf(fp, "      {\"id\": ");
+            json_write_string(fp, ent->d_name);
+            fprintf(fp, ", \"type\": ");
+            json_write_string(fp, type ? type : "unknown");
+            fprintf(fp, ", \"temp_millidegC\": %s}",
                     temp ? temp : "0");
             first = 0;
             free(type);
@@ -263,23 +334,60 @@ static void detect_touchscreen(FILE *fp) {
     json_indent_in();
     fprintf(fp, "    \"enable\": true,\n");
 
-    /* Check for touchscreen devices */
+    /* Check for touchscreen devices by looking for ABS_MT axes */
     int has_touch = 0;
     DIR *input_dir = opendir("/dev/input");
     if (input_dir) {
         struct dirent *ent;
-        while ((ent = readdir(input_dir)) != NULL) {
+        /* Scan for event devices and check for MT capability */
+        while ((ent = readdir(input_dir)) != NULL && !has_touch) {
             if (strncmp(ent->d_name, "event", 5) != 0) continue;
-            /* Could check EV_ABS/ABS_MT here, but keep it simple */
-            has_touch = 1;
-            break;
+            char evdev_path[256];
+            snprintf(evdev_path, sizeof(evdev_path), "/dev/input/%s", ent->d_name);
+            int fd = open(evdev_path, O_RDONLY);
+            if (fd >= 0) {
+                /* Check for ABS_MT_POSITION_X (0x35) — definitive touchscreen indicator */
+                unsigned long absbit[ABSBIT_WORDS] = {0};
+                if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbit)), absbit) == 0) {
+                    if (test_bit(ABS_MT_POSITION_X, absbit) ||
+                        test_bit(ABS_MT_POSITION_Y, absbit)) {
+                        has_touch = 1;
+                    }
+                }
+                close(fd);
+            }
         }
         closedir(input_dir);
     }
 
+    /* Try to read screen resolution from DRM/KMS or fbdev */
+    int screen_w = 1080, screen_h = 2400;  /* Default for tablet */
+    char drm_path[256];
+    DIR *drm_dir = opendir("/sys/class/drm");
+    if (drm_dir) {
+        struct dirent *ent;
+        while ((ent = readdir(drm_dir)) != NULL && (screen_w == 1080 || screen_h == 2400)) {
+            /* Look for active connector: .../card0-<name>/modes */
+            if (strncmp(ent->d_name, "card0-", 6) != 0) continue;
+            snprintf(drm_path, sizeof(drm_path),
+                     "/sys/class/drm/%s/modes", ent->d_name);
+            char *modes = read_file(drm_path);
+            if (modes) {
+                /* Format: WxH (e.g., "1080x2400") */
+                int w = 0, h = 0;
+                if (sscanf(modes, "%dx%d", &w, &h) == 2) {
+                    screen_w = w;
+                    screen_h = h;
+                }
+                free(modes);
+            }
+        }
+        closedir(drm_dir);
+    }
+
     fprintf(fp, "    \"has_touchscreen\": %s,\n", has_touch ? "true" : "false");
-    fprintf(fp, "    \"screen_width\": 1080,\n");
-    fprintf(fp, "    \"screen_height\": 2400,\n");
+    fprintf(fp, "    \"screen_width\": %d,\n", screen_w);
+    fprintf(fp, "    \"screen_height\": %d,\n", screen_h);
     fprintf(fp, "    \"swipeThd\": 0.03,\n");
     fprintf(fp, "    \"gestureThdX\": 0.03,\n");
     fprintf(fp, "    \"gestureThdY\": 0.03,\n");

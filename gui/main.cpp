@@ -60,11 +60,6 @@ public:
                       "org.uperflinux.Daemon",
                       "HeavyLoadStateChanged",
                       this, SLOT(onHeavyLoadChanged(QVariantList)));
-        m_bus.connect("org.uperflinux.Daemon",
-                      "/org/uperflinux/Daemon",
-                      "org.uperflinux.Daemon",
-                      "StatsUpdated",
-                      this, SLOT(onThermalUpdated(QVariantList)));
     }
 
     QString currentMode() const { return m_currentMode; }
