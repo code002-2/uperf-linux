@@ -4,7 +4,9 @@
 	dh $@
 
 override_dh_auto_build:
-	cd .. && mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=ON && make -j$(nproc)
+	mkdir -p ../build
+	cd ../build && cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DBUILD_GUI=ON
+	cd ../build && make -j$(nproc)
 
 override_dh_auto_install:
 	cd ../build && make install DESTDIR=../debian/uperf-linux-gui

@@ -22,24 +22,35 @@ jobs:
         docker run --rm --platform linux/arm64 -v ${{ github.workspace }}:/repo ubuntu:24.04 bash -c '
           apt-get update && apt-get install -y gcc g++ cmake pkg-config make file \
             libjson-c-dev libglib2.0-dev libdbus-1-dev libsystemd-dev \
-            qt6-base-dev qt6-charts-dev qt6-declarative-dev
+            qt6-base-dev qt6-charts-dev qt6-declarative-dev dpkg-dev
 
           # Build everything
           cd /repo && mkdir -p build-arm64 && cd build-arm64
           cmake .. -DBUILD_TESTS=OFF
           make -j$(nproc)
 
+          # Build deb package
+          cpack -G DEB
+
           file uperf-linux uperfctl uperf-wizard gui/uperf-gui
           ls -lh uperf-linux uperfctl uperf-wizard gui/uperf-gui
+          ls -lh *.deb
         '
 
-    - name: Upload artifacts
+    - name: Upload binaries
       uses: actions/upload-artifact@v4
       with:
-        name: uperf-linux-arm64
+        name: uperf-linux-arm64-binaries
         path: |
           ${{ github.workspace }}/build-arm64/uperf-linux
           ${{ github.workspace }}/build-arm64/uperfctl
           ${{ github.workspace }}/build-arm64/uperf-wizard
           ${{ github.workspace }}/build-arm64/gui/uperf-gui
+        retention-days: 7
+
+    - name: Upload deb package
+      uses: actions/upload-artifact@v4
+      with:
+        name: uperf-linux-arm64-deb
+        path: ${{ github.workspace }}/build-arm64/*.deb
         retention-days: 7

@@ -1,0 +1,32 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        mkdir -p /run/uperf-linux
+        chmod 755 /run/uperf-linux
+
+        if systemctl is-active --quiet uperf-linux.service 2>/dev/null; then
+            systemctl reload uperf-linux.service 2>/dev/null || true
+        else
+            systemctl enable uperf-linux.service 2>/dev/null || true
+            systemctl start uperf-linux.service 2>/dev/null || true
+        fi
+
+        echo "uperf-linux GUI installed successfully."
+        echo "Start the daemon: sudo systemctl start uperf-linux"
+        echo "Launch GUI: uperf-gui"
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

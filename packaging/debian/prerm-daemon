@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    purge)
+        systemctl stop uperf-linux.service 2>/dev/null || true
+        systemctl disable uperf-linux.service 2>/dev/null || true
+        rm -rf /run/uperf-linux
+        echo "uperf-linux removed."
+        ;;
+
+    remove|upgrade|abortbootstrap)
+        ;;
+
+    *)
+        echo "prerm called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

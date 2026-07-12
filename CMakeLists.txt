@@ -167,12 +167,19 @@ install(DIRECTORY config/ DESTINATION /etc/uperf-linux)
 install(FILES systemd/uperf-linux.service DESTINATION /etc/systemd/system)
 
 # ---- Deb packaging ----
-if(BUILD_GUI AND Qt6_FOUND)
-    # Create a package target for deb
-    add_custom_target(package
-        COMMAND cmake -E make_directory "${CMAKE_BINARY_DIR}/deb"
-        COMMAND cpack --config CPackConfig.cmake
-        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-        COMMENT "Building deb package"
-    )
-endif()
+set(CPACK_PACKAGE_NAME "uperf-linux")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Userspace performance scheduler for Linux ARM64")
+set(CPACK_PACKAGE_VENDOR "code002-2")
+set(CPACK_PACKAGE_CONTACT "hiez832670@gmail.com")
+set(CPACK_PACKAGE_FILE_NAME "uperf-linux-${CPACK_PACKAGE_VERSION}-arm64")
+set(CPACK_GENERATOR "DEB")
+set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "arm64")
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "libglib2.0-0 (>= 2.0), libdbus-1-3 (>= 1.0), libjson-c5 (>= 0.12), libsystemd0 (>= 209)")
+set(CPACK_DEBIAN_PACKAGE_SECTION "utils")
+set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
+set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
+    "${CMAKE_CURRENT_SOURCE_DIR}/packaging/debian/postinst-daemon;${CMAKE_CURRENT_SOURCE_DIR}/packaging/debian/prerm-daemon"
+)
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+include(CPack)
