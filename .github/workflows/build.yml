@@ -10,75 +10,54 @@ on:
 jobs:
   build-daemon:
     runs-on: ubuntu-22.04
-    container:
-      image: ubuntu:22.04
-      options: --platform linux/arm64
     steps:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Install build deps
-      run: |
-        apt-get update
-        apt-get install -y gcc g++ cmake pkg-config make file \
-          libjson-c-dev libglib2.0-dev libdbus-1-dev libsystemd-dev
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
 
-    - name: Build daemon + CLI + wizard
+    - name: Build daemon in ARM64 container
       run: |
-        mkdir build
-        cd build
-        cmake .. -DBUILD_GUI=OFF -DBUILD_TESTS=OFF
-        make -j$(nproc)
-
-    - name: Verify binaries
-      run: |
-        file build/uperf-linux
-        file build/uperfctl
-        file build/uperf-wizard
-        ls -lh build/uperf-linux build/uperfctl build/uperf-wizard
+        docker run --rm --platform linux/arm64 -v ${{ github.workspace }}:/repo ubuntu:22.04 bash -c '
+          apt-get update && apt-get install -y gcc g++ cmake pkg-config make file libjson-c-dev libglib2.0-dev libdbus-1-dev libsystemd-dev
+          cd /repo && mkdir -p build-arm64 && cd build-arm64 && cmake .. -DBUILD_GUI=OFF -DBUILD_TESTS=OFF && make -j$(nproc)
+          file uperf-linux uperfctl uperf-wizard
+          ls -lh uperf-linux uperfctl uperf-wizard
+        '
 
     - name: Upload daemon artifacts
       uses: actions/upload-artifact@v4
       with:
         name: uperf-linux-arm64
         path: |
-          build/uperf-linux
-          build/uperfctl
-          build/uperf-wizard
+          ${{ github.workspace }}/build-arm64/uperf-linux
+          ${{ github.workspace }}/build-arm64/uperfctl
+          ${{ github.workspace }}/build-arm64/uperf-wizard
         retention-days: 7
 
   build-gui:
     runs-on: ubuntu-22.04
-    container:
-      image: ubuntu:22.04
-      options: --platform linux/arm64
     needs: build-daemon
     steps:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Install Qt6 build deps
-      run: |
-        apt-get update
-        apt-get install -y gcc g++ cmake pkg-config make file \
-          libjson-c-dev libglib2.0-dev libdbus-1-dev libsystemd-dev \
-          qt6-base-dev qt6-charts-dev qt6-qml-dev qtbase6-dev-tools
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
 
-    - name: Build GUI
+    - name: Build GUI in ARM64 container
       run: |
-        mkdir build
-        cd build
-        cmake .. -DBUILD_TESTS=OFF
-        make -j$(nproc)
-
-    - name: Verify GUI binary
-      run: |
-        file build/gui/uperf-gui
-        ls -lh build/gui/uperf-gui
+        docker run --rm --platform linux/arm64 -v ${{ github.workspace }}:/repo ubuntu:22.04 bash -c '
+          apt-get update && apt-get install -y gcc g++ cmake pkg-config make file libjson-c-dev libglib2.0-dev libdbus-1-dev libsystemd-dev qt6-base-dev qt6-charts-dev qt6-qml-dev qtbase6-dev-tools
+          cd /repo && mkdir -p build-arm64 && cd build-arm64 && cmake .. -DBUILD_TESTS=OFF && make -j$(nproc)
+          file gui/uperf-gui
+          ls -lh gui/uperf-gui
+        '
 
     - name: Upload GUI artifact
       uses: actions/upload-artifact@v4
       with:
         name: uperf-gui-arm64
-        path: build/gui/uperf-gui
+        path: ${{ github.workspace }}/build-arm64/gui/uperf-gui
         retention-days: 7
