@@ -286,18 +286,17 @@ int main(int argc, char *argv[]) {
     ModeProxy *proxy = new ModeProxy(&app);
     engine.rootContext()->setContextProperty("modeProxy", proxy);
 
-    // Load QML from resources or file
-    const QUrl url(QStringLiteral("qrc:/qml/Main.qml"));
+    // Load QML from installed location or fallback paths
+    const QUrl url(QStringLiteral("/usr/share/uperf-gui/qml/Main.qml"));
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreated,
             &app, [url](QObject *obj, const QUrl &objUrl) {
         if (!obj && url == objUrl)
             QCoreApplication::exit(-1);
     }, Qt::QueuedConnection);
 
-    // Try loading from qrc first, then from filesystem
     engine.load(url);
     if (engine.rootObjects().isEmpty()) {
-        // Fallback: load from filesystem (for development)
+        // Fallback: try local dev path
         engine.load(QUrl::fromLocalFile(QStringLiteral("gui/qml/Main.qml")));
     }
 
