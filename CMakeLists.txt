@@ -181,5 +181,6 @@ set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
 set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
     "${CMAKE_CURRENT_SOURCE_DIR}/packaging/debian/postinst-daemon;${CMAKE_CURRENT_SOURCE_DIR}/packaging/debian/prerm-daemon"
 )
-set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+# Disable automatic shlibdeps to avoid pulling in Qt6 runtime deps from the GUI build
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS OFF)
 include(CPack)
