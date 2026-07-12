@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-daemon:
+  build:
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout
@@ -17,7 +17,7 @@ jobs:
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v3
 
-    - name: Build daemon in ARM64 container
+    - name: Build in ARM64 container
       run: |
         docker run --rm --platform linux/arm64 -v ${{ github.workspace }}:/repo ubuntu:24.04 bash -c '
           apt-get update && apt-get install -y gcc g++ cmake pkg-config make file libjson-c-dev libglib2.0-dev libdbus-1-dev libsystemd-dev
@@ -26,7 +26,7 @@ jobs:
           ls -lh uperf-linux uperfctl uperf-wizard
         '
 
-    - name: Upload daemon artifacts
+    - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
         name: uperf-linux-arm64
@@ -34,30 +34,4 @@ jobs:
           ${{ github.workspace }}/build-arm64/uperf-linux
           ${{ github.workspace }}/build-arm64/uperfctl
           ${{ github.workspace }}/build-arm64/uperf-wizard
-        retention-days: 7
-
-  build-gui:
-    runs-on: ubuntu-22.04
-    needs: build-daemon
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-
-    - name: Set up QEMU
-      uses: docker/setup-qemu-action@v3
-
-    - name: Build GUI in ARM64 container
-      run: |
-        docker run --rm --platform linux/arm64 -v ${{ github.workspace }}:/repo ubuntu:24.04 bash -c '
-          apt-get update && apt-get install -y gcc g++ cmake pkg-config make file libjson-c-dev libglib2.0-dev libdbus-1-dev libsystemd-dev qt6-base-dev qt6-charts-dev qt6-qml-dev qtbase6-dev-tools
-          cd /repo && mkdir -p build-arm64 && cd build-arm64 && cmake .. -DBUILD_TESTS=OFF && make -j$(nproc)
-          file gui/uperf-gui
-          ls -lh gui/uperf-gui
-        '
-
-    - name: Upload GUI artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: uperf-gui-arm64
-        path: ${{ github.workspace }}/build-arm64/gui/uperf-gui
         retention-days: 7
