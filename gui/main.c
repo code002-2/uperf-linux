@@ -559,7 +559,7 @@ static GtkWidget *create_frequency_page(void) {
 static void on_activate(GtkApplication *app, gpointer ud) {
     (void)ud;
 
-    GtkWidget *window = adw_application_window_new(ADW_APPLICATION(app));
+    GtkWidget *window = adw_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(window), "uperf-linux");
     gtk_window_set_default_size(GTK_WINDOW(window), 1080, 2400);
 
@@ -601,7 +601,7 @@ static void on_activate(GtkApplication *app, gpointer ud) {
         gtk_header_bar_pack_start(GTK_HEADER_BAR(tab_bar), btn);
     }
 
-    gtk_window_set_content(GTK_WINDOW(window), g_app.stack);
+    adw_window_set_content(ADW_WINDOW(window), g_app.stack);
     gtk_window_present(GTK_WINDOW(window));
 }
 
