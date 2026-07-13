@@ -4,8 +4,13 @@
 #include "dbus_proxy.h"
 
 #define UPERF_DBUS_PROXY(obj) (G_TYPE_CHECK_INSTANCE_CAST((obj), uperf_dbus_proxy_get_type(), DbusProxy))
+#define DAEMON_BUS    "org.uperflinux.Daemon"
 #define DAEMON_PATH   "/org/uperflinux/Daemon"
 #define DAEMON_IFACE  "org.uperflinux.Daemon"
+
+/* Forward declarations for functions referenced in get_type() */
+static void uperf_dbus_proxy_init(DbusProxy *self);
+static void uperf_dbus_proxy_class_init(DbusProxyClass *klass);
 
 /* G_TIMEOUT_DEFAULT was removed in GLib 2.80+, use G_MAXUINT */
 #ifndef G_TIMEOUT_DEFAULT
