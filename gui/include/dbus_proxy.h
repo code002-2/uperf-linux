@@ -5,12 +5,10 @@
 #include <glib-object.h>
 #include <gio/gio.h>
 
-G_BEGIN_DECLS
-
 #define UPERF_TYPE_DBUS_PROXY (uperf_dbus_proxy_get_type())
 
 typedef struct _DbusProxy     DbusProxy;
-typedef struct DbusProxyClass DbusProxyClass;
+typedef struct _DbusProxyClass DbusProxyClass;
 
 struct _DbusProxy {
     GObject parent;
@@ -67,6 +65,4 @@ gboolean dbus_proxy_apply_settings(DbusProxy *self,
 gboolean dbus_proxy_apply_freq_override(DbusProxy *self,
     gint64 prime, gint64 perf, gint64 eff, gint64 gpu);
 gboolean dbus_proxy_release_freq_override(DbusProxy *self);
-
-G_END_DECLS
 #endif
