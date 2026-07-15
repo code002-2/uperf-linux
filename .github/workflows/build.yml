@@ -19,18 +19,29 @@ jobs:
 
     - name: Build in ARM64 container
       run: |
-        docker run --rm --platform linux/arm64 -v ${{ github.workspace }}:/repo ubuntu:24.04 bash -c '
-          apt-get update && apt-get install -y gcc g++ cmake pkg-config make file \
-            libjson-c-dev libglib2.0-dev libdbus-1-dev libsystemd-dev \
+        docker run --rm --platform linux/arm64 \
+          -v "${{ github.workspace }}:/repo" \
+          ubuntu:24.04 bash -euo pipefail -c '
+          export DEBIAN_FRONTEND=noninteractive
+
+          # The ARM64 image uses ports.ubuntu.com. HTTPS avoids runners where
+          # outbound plain HTTP is unavailable, and retries handle mirror hiccups.
+          sed -i "s|http://ports.ubuntu.com/ubuntu-ports|https://ports.ubuntu.com/ubuntu-ports|g" \
+            /etc/apt/sources.list.d/ubuntu.sources
+          apt-get -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update
+          apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+            gcc g++ cmake pkg-config make file \
             libjson-c-dev libglib2.0-dev libdbus-1-dev libsystemd-dev \
             libgtk-4-dev libadwaita-1-dev dpkg-dev
 
           # Build everything
-          cd /repo && mkdir -p build-arm64 && cd build-arm64
-          cmake .. -DBUILD_TESTS=OFF
-          make -j$(nproc)
+          cmake -S /repo -B /repo/build-arm64 \
+            -DBUILD_TESTS=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build /repo/build-arm64 --parallel "$(nproc)"
 
           # Build deb package
+          cd /repo/build-arm64
           cpack -G DEB
 
           file uperf-linux uperfctl uperf-wizard gui/uperf-gui
