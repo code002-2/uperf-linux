@@ -225,7 +225,8 @@ TEST(test_custom_perapp_process_is_detected) {
     int count = game_scanner_get_results(gs, results, MAX_GAMES);
     bool found = false;
     for (int i = 0; i < count; i++) {
-        if (results[i].pid == child) found = true;
+        if (results[i].pid == child && results[i].start_time != 0)
+            found = true;
     }
 
     kill(child, SIGTERM);

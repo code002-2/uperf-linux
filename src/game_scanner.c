@@ -34,6 +34,35 @@ struct GameScanner {
     PerAppConfig perapp;
 };
 
+static uint64_t read_process_start_time(pid_t pid) {
+    char path[64];
+    char buffer[1024];
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    FILE *file = fopen(path, "r");
+    if (!file) return 0;
+    if (!fgets(buffer, sizeof(buffer), file)) {
+        fclose(file);
+        return 0;
+    }
+    fclose(file);
+
+    char *cursor = strrchr(buffer, ')');
+    if (!cursor || cursor[1] != ' ') return 0;
+    cursor += 2;
+    if (cursor[0] == '\0' || cursor[1] != ' ') return 0;
+    cursor += 2;
+    for (int field = 4; field <= 22; field++) {
+        while (*cursor == ' ') cursor++;
+        if (*cursor == '\0') return 0;
+        char *end = NULL;
+        unsigned long long value = strtoull(cursor, &end, 10);
+        if (end == cursor) return 0;
+        if (field == 22) return (uint64_t)value;
+        cursor = end;
+    }
+    return 0;
+}
+
 static void copy_truncated(char *dst, size_t dst_size, const char *src) {
     if (!dst || dst_size == 0) return;
     size_t n = src ? strnlen(src, dst_size - 1) : 0;
@@ -161,8 +190,11 @@ int game_scanner_scan(GameScanner *gs) {
             &gs->perapp, comm, cmdline, &configured_mode);
         if (matches_pattern(gs, comm) || command_matches ||
             (configured && configured_mode != MODE_BALANCE)) {
+            uint64_t start_time = read_process_start_time(pid);
+            if (start_time == 0) continue;
             GameProcess *p = &gs->entries[count];
             p->pid = pid;
+            p->start_time = start_time;
             copy_truncated(p->comm, sizeof(p->comm), comm);
             copy_truncated(p->cmdline, sizeof(p->cmdline), cmdline);
             p->package[0] = '\0';

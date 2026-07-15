@@ -38,6 +38,7 @@ static GVariant *call_and_dispatch(GDBusConnection *connection,
 static int mode_callback_count;
 static int mode_signal_count;
 static int reload_callback_count;
+static int active_pid_callback_count;
 
 static void on_set_mode(const char *mode, void *user_data) {
     DbusManager *manager = user_data;
@@ -69,6 +70,13 @@ static gboolean on_reload(void *user_data) {
     return TRUE;
 }
 
+static gboolean on_active_pid(pid_t pid, void *user_data) {
+    (void)user_data;
+    assert(pid == 4242 || pid == 0);
+    active_pid_callback_count++;
+    return TRUE;
+}
+
 int main(void) {
     GTestDBus *test_bus = g_test_dbus_new(G_TEST_DBUS_NONE);
     g_test_dbus_up(test_bus);
@@ -77,6 +85,7 @@ int main(void) {
     assert(manager != NULL);
     dbus_manager_set_mode_handler(manager, on_set_mode, manager);
     dbus_manager_set_reload_handler(manager, on_reload, NULL);
+    dbus_manager_set_active_pid_handler(manager, on_active_pid, NULL);
 
     GError *error = NULL;
     GDBusConnection *client = g_dbus_connection_new_for_address_sync(
@@ -142,6 +151,25 @@ int main(void) {
         g_usleep(1000);
     }
     assert(mode_signal_count == 1);
+
+    reply = call_and_dispatch(
+        client, "org.uperflinux.Daemon", "SetActiveProcess",
+        g_variant_new("(i)", 4242), G_VARIANT_TYPE("(b)"));
+    g_variant_get(reply, "(b)", &success);
+    assert(success && active_pid_callback_count == 1);
+    assert(dbus_manager_get_active_pid(manager) == 4242);
+    g_variant_unref(reply);
+
+    reply = call_and_dispatch(
+        client, "org.freedesktop.DBus.Properties", "Get",
+        g_variant_new("(ss)", "org.uperflinux.Daemon", "ActiveProcess"),
+        G_VARIANT_TYPE("(v)"));
+    GVariant *active_box = g_variant_get_child_value(reply, 0);
+    GVariant *active_variant = g_variant_get_variant(active_box);
+    assert(g_variant_get_int32(active_variant) == 4242);
+    g_variant_unref(active_variant);
+    g_variant_unref(active_box);
+    g_variant_unref(reply);
 
     reply = call_and_dispatch(
         client, "org.uperflinux.Daemon", "SetMode",

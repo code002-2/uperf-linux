@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <regex.h>
 #include <unistd.h>
 
 /* ----------------------------------------------------------------
@@ -308,69 +309,352 @@ static int resolve_power_model_cpumasks(Config *cfg) {
     return 0;
 }
 
-static AffinityClass parse_affinity_class(const char *s) {
-    if (!s) return AC_AUTO;
-    if (strcmp(s, "bg") == 0)   return AC_BG;
-    if (strcmp(s, "norm") == 0) return AC_NORM;
-    if (strcmp(s, "coop") == 0) return AC_COOP;
-    if (strcmp(s, "ui") == 0)   return AC_UI;
-    if (strcmp(s, "rtusr") == 0) return AC_RTUSR;
-    if (strcmp(s, "all") == 0)  return AC_NORM;
-    return AC_AUTO;
+static const char *SCHED_CONTEXT_NAMES[SCHED_CTX_NUM] = {
+    "bg", "fg", "idle", "touch", "boost"
+};
+
+static int find_cpumask(const SchedConfig *sched, const char *name) {
+    if (!sched || !name) return -1;
+    for (int i = 0; i < sched->nr_cpumasks; i++) {
+        if (strcmp(sched->cpumasks[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+static int find_affinity_profile(const SchedConfig *sched, const char *name) {
+    if (!sched || !name) return -1;
+    for (int i = 0; i < sched->nr_affinity_profiles; i++) {
+        if (strcmp(sched->affinity_profiles[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+static int find_priority_profile(const SchedConfig *sched, const char *name) {
+    if (!sched || !name) return -1;
+    for (int i = 0; i < sched->nr_priority_profiles; i++) {
+        if (strcmp(sched->priority_profiles[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+static int validate_regex(const char *pattern, const char *what) {
+    regex_t compiled;
+    int result = regcomp(&compiled, pattern, REG_EXTENDED | REG_NOSUB);
+    if (result == 0) {
+        regfree(&compiled);
+        return 0;
+    }
+    char error[160];
+    regerror(result, &compiled, error, sizeof(error));
+    log_error("Invalid %s regex '%s': %s", what, pattern, error);
+    return -1;
+}
+
+static int parse_sched_affinity(struct json_object *mod_obj, Config *cfg) {
+    struct json_object *profiles = NULL;
+    cfg->sched.nr_affinity_profiles = 0;
+    if (!json_object_object_get_ex(mod_obj, "affinity", &profiles)) return 0;
+    if (!json_object_is_type(profiles, json_type_object)) {
+        log_error("sched.affinity must be an object");
+        return -1;
+    }
+
+    json_object_object_foreach(profiles, name, value) {
+        if (cfg->sched.nr_affinity_profiles >= MAX_AFFINITY_PROFILES) {
+            log_error("Too many sched affinity profiles (maximum %d)",
+                      MAX_AFFINITY_PROFILES);
+            return -1;
+        }
+        if (!json_object_is_type(value, json_type_object)) {
+            log_error("sched.affinity.%s must be an object", name);
+            return -1;
+        }
+        AffinityProfile *profile =
+            &cfg->sched.affinity_profiles[cfg->sched.nr_affinity_profiles];
+        memset(profile, 0, sizeof(*profile));
+        snprintf(profile->name, sizeof(profile->name), "%s", name);
+        for (int context = 0; context < SCHED_CTX_NUM; context++) {
+            struct json_object *mask_value = NULL;
+            if (!json_object_object_get_ex(value,
+                                           SCHED_CONTEXT_NAMES[context],
+                                           &mask_value))
+                continue;
+            if (!json_object_is_type(mask_value, json_type_string)) {
+                log_error("sched.affinity.%s.%s must be a string", name,
+                          SCHED_CONTEXT_NAMES[context]);
+                return -1;
+            }
+            const char *mask_name = json_object_get_string(mask_value);
+            if (!mask_name || mask_name[0] == '\0') continue;
+            int index = find_cpumask(&cfg->sched, mask_name);
+            if (index < 0) {
+                log_error("sched.affinity.%s.%s references unknown cpumask '%s'",
+                          name, SCHED_CONTEXT_NAMES[context], mask_name);
+                return -1;
+            }
+            profile->masks[context] = cfg->sched.cpumasks[index].mask;
+            profile->has_mask[context] = true;
+        }
+        cfg->sched.nr_affinity_profiles++;
+    }
+    return 0;
+}
+
+static bool valid_priority_value(int value) {
+    return value == 0 || value == -1 || value == -2 || value == -3 ||
+           (value >= 1 && value <= 98) ||
+           (value >= 100 && value <= 139);
+}
+
+static int parse_sched_priorities(struct json_object *mod_obj, Config *cfg) {
+    struct json_object *profiles = NULL;
+    cfg->sched.nr_priority_profiles = 0;
+    if (!json_object_object_get_ex(mod_obj, "prio", &profiles)) return 0;
+    if (!json_object_is_type(profiles, json_type_object)) {
+        log_error("sched.prio must be an object");
+        return -1;
+    }
+
+    json_object_object_foreach(profiles, name, value) {
+        if (cfg->sched.nr_priority_profiles >= MAX_PRIORITY_PROFILES) {
+            log_error("Too many sched priority profiles (maximum %d)",
+                      MAX_PRIORITY_PROFILES);
+            return -1;
+        }
+        if (!json_object_is_type(value, json_type_object)) {
+            log_error("sched.prio.%s must be an object", name);
+            return -1;
+        }
+        PriorityProfile *profile =
+            &cfg->sched.priority_profiles[cfg->sched.nr_priority_profiles];
+        memset(profile, 0, sizeof(*profile));
+        snprintf(profile->name, sizeof(profile->name), "%s", name);
+        for (int context = 0; context < SCHED_CTX_NUM; context++) {
+            struct json_object *priority = NULL;
+            if (!json_object_object_get_ex(value,
+                                           SCHED_CONTEXT_NAMES[context],
+                                           &priority))
+                continue;
+            if (!json_object_is_type(priority, json_type_int)) {
+                log_error("sched.prio.%s.%s must be an integer", name,
+                          SCHED_CONTEXT_NAMES[context]);
+                return -1;
+            }
+            int encoded = json_object_get_int(priority);
+            if (!valid_priority_value(encoded)) {
+                log_error("sched.prio.%s.%s has invalid value %d", name,
+                          SCHED_CONTEXT_NAMES[context], encoded);
+                return -1;
+            }
+            profile->values[context] = encoded;
+        }
+        cfg->sched.nr_priority_profiles++;
+    }
+    return 0;
+}
+
+static int find_cgroup_class(const CgroupConfig *cgroup, const char *name) {
+    if (!cgroup || !name) return -1;
+    for (int i = 0; i < cgroup->nr_classes; i++) {
+        if (strcmp(cgroup->classes[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+static int parse_cgroup_config(struct json_object *modules_obj, Config *cfg) {
+    struct json_object *cgroup_obj = NULL;
+    cfg->cgroup.enable = false;
+    snprintf(cfg->cgroup.backend, sizeof(cfg->cgroup.backend), "systemd");
+    if (!json_object_object_get_ex(modules_obj, "cgroup", &cgroup_obj))
+        return 0;
+    if (!json_object_is_type(cgroup_obj, json_type_object)) {
+        log_error("modules.cgroup must be an object");
+        return -1;
+    }
+    cfg->cgroup.enable = parse_bool_field(cgroup_obj, "enable", true);
+    const char *backend = NULL;
+    if (parse_string_field(cgroup_obj, "backend", &backend) == 0 && backend)
+        snprintf(cfg->cgroup.backend, sizeof(cfg->cgroup.backend), "%s",
+                 backend);
+
+    struct json_object *classes = NULL;
+    if (!json_object_object_get_ex(cgroup_obj, "classes", &classes)) return 0;
+    if (!json_object_is_type(classes, json_type_object)) {
+        log_error("cgroup.classes must be an object");
+        return -1;
+    }
+    json_object_object_foreach(classes, name, value) {
+        if (cfg->cgroup.nr_classes >= MAX_CGROUP_CLASSES) {
+            log_error("Too many cgroup classes (maximum %d)",
+                      MAX_CGROUP_CLASSES);
+            return -1;
+        }
+        if (!json_object_is_type(value, json_type_object)) {
+            log_error("cgroup.classes.%s must be an object", name);
+            return -1;
+        }
+        CgroupClass *klass = &cfg->cgroup.classes[cfg->cgroup.nr_classes];
+        memset(klass, 0, sizeof(*klass));
+        snprintf(klass->name, sizeof(klass->name), "%s", name);
+        klass->cpu_weight = 100;
+        klass->uclamp_max = 1024;
+        const char *mask_name = NULL;
+        if (parse_string_field(value, "cpumask", &mask_name) == 0 &&
+            mask_name && mask_name[0] != '\0') {
+            int index = find_cpumask(&cfg->sched, mask_name);
+            if (index < 0) {
+                log_error("cgroup.classes.%s references unknown cpumask '%s'",
+                          name, mask_name);
+                return -1;
+            }
+            snprintf(klass->cpumask_name, sizeof(klass->cpumask_name), "%s",
+                     mask_name);
+            klass->cpu_mask = cfg->sched.cpumasks[index].mask;
+        }
+        parse_int_field(value, "cpuWeight", &klass->cpu_weight);
+        parse_int_field(value, "uclampMin", &klass->uclamp_min);
+        parse_int_field(value, "uclampMax", &klass->uclamp_max);
+        if (klass->cpu_weight < 1 || klass->cpu_weight > 10000 ||
+            klass->uclamp_min < 0 || klass->uclamp_min > 1024 ||
+            klass->uclamp_max < 0 || klass->uclamp_max > 1024 ||
+            klass->uclamp_min > klass->uclamp_max) {
+            log_error("cgroup.classes.%s has invalid weight/uClamp values",
+                      name);
+            return -1;
+        }
+        cfg->cgroup.nr_classes++;
+    }
+    return 0;
 }
 
 static int parse_sched_rules(struct json_object *mod_obj, Config *cfg) {
-    struct json_object *rules_arr;
+    struct json_object *rules_arr = NULL;
     if (!json_object_object_get_ex(mod_obj, "rules", &rules_arr))
         return 0;  /* Optional */
+    if (!json_object_is_type(rules_arr, json_type_array)) {
+        log_error("sched.rules must be an array");
+        return -1;
+    }
 
     int nr = json_object_array_length(rules_arr);
-    if (nr > MAX_RULES) nr = MAX_RULES;
+    if (nr > MAX_RULES) {
+        log_error("Too many sched process rules (maximum %d)", MAX_RULES);
+        return -1;
+    }
 
-    cfg->sched.nr_rules = nr;
+    cfg->sched.nr_rules = 0;
     for (int i = 0; i < nr; i++) {
         struct json_object *rule_obj = json_object_array_get_idx(rules_arr, i);
-        SchedRule *rule = &cfg->sched.rules[i];
+        if (!json_object_is_type(rule_obj, json_type_object)) {
+            log_error("sched.rules[%d] must be an object", i);
+            return -1;
+        }
+        SchedRule *rule = &cfg->sched.rules[cfg->sched.nr_rules];
         memset(rule, 0, sizeof(*rule));
 
         const char *name_str = NULL;
         parse_string_field(rule_obj, "name", &name_str);
-        if (name_str)
-            strncpy(rule->name, name_str, MAX_NAME_LEN - 1);
+        if (name_str) snprintf(rule->name, sizeof(rule->name), "%s", name_str);
 
         const char *regex_str = NULL;
         parse_string_field(rule_obj, "regex", &regex_str);
         if (regex_str)
-            strncpy(rule->regex, regex_str, MAX_PATH_LEN - 1);
+            snprintf(rule->regex, sizeof(rule->regex), "%s", regex_str);
 
         rule->pinned = parse_bool_field(rule_obj, "pinned", false);
-
-        /* Parse nested rules array for affinity/priority */
-        struct json_object *nested;
-        if (json_object_object_get_ex(rule_obj, "rules", &nested)) {
-            int nn = json_object_array_length(nested);
-            if (nn > 0) {
-                struct json_object *first = json_object_array_get_idx(nested, 0);
-                const char *ac_str = NULL;
-                parse_string_field(first, "ac", &ac_str);
-                rule->affinity_class = parse_affinity_class(ac_str);
-
-                const char *pc_str = NULL;
-                parse_string_field(first, "pc", &pc_str);
-                if (pc_str) {
-                    if (strcmp(pc_str, "bg") == 0)   rule->prio_profile.fg = -3;
-                    else if (strcmp(pc_str, "norm") == 0) rule->prio_profile.fg = -1;
-                    else if (strcmp(pc_str, "coop") == 0) rule->prio_profile.fg = 124;
-                    else if (strcmp(pc_str, "ui") == 0)   rule->prio_profile.fg = 120;
-                    else if (strcmp(pc_str, "rtusr") == 0) rule->prio_profile.fg = 98;
-                    else                                   rule->prio_profile.fg = 0;
-                }
-            }
+        rule->match_game = parse_bool_field(rule_obj, "game", false);
+        const char *cgroup_name = NULL;
+        if (parse_string_field(rule_obj, "cgroup", &cgroup_name) == 0 &&
+            cgroup_name)
+            snprintf(rule->cgroup_class, sizeof(rule->cgroup_class), "%s",
+                     cgroup_name);
+        if (rule->regex[0] == '\0' && !rule->match_game) {
+            log_error("sched.rules[%d] needs a process regex or game=true", i);
+            return -1;
+        }
+        if (rule->regex[0] != '\0' &&
+            validate_regex(rule->regex, "process") < 0)
+            return -1;
+        if (rule->cgroup_class[0] != '\0' &&
+            find_cgroup_class(&cfg->cgroup, rule->cgroup_class) < 0) {
+            log_error("sched.rules[%d] references unknown cgroup class '%s'",
+                      i, rule->cgroup_class);
+            return -1;
         }
 
-        log_debug("sched rule[%d]: %s regex=%s pinned=%d ac=%d prio_fg=%d",
-                   i, rule->name, rule->regex, rule->pinned,
-                   rule->affinity_class, rule->prio_profile.fg);
+        struct json_object *nested = NULL;
+        if (json_object_object_get_ex(rule_obj, "rules", &nested)) {
+            if (!json_object_is_type(nested, json_type_array)) {
+                log_error("sched.rules[%d].rules must be an array", i);
+                return -1;
+            }
+            int nn = json_object_array_length(nested);
+            if (nn > MAX_THREAD_RULES) {
+                log_error("sched.rules[%d] has more than %d thread rules", i,
+                          MAX_THREAD_RULES);
+                return -1;
+            }
+            for (int j = 0; j < nn; j++) {
+                struct json_object *thread_obj =
+                    json_object_array_get_idx(nested, j);
+                if (!json_object_is_type(thread_obj, json_type_object)) {
+                    log_error("sched.rules[%d].rules[%d] must be an object", i,
+                              j);
+                    return -1;
+                }
+                SchedThreadRule *thread = &rule->thread_rules[j];
+                memset(thread, 0, sizeof(*thread));
+                thread->affinity_index = -1;
+                thread->priority_index = -1;
+                const char *thread_regex = NULL;
+                parse_string_field(thread_obj, "k", &thread_regex);
+                if (!thread_regex || thread_regex[0] == '\0') {
+                    log_error("sched.rules[%d].rules[%d] needs regex 'k'", i,
+                              j);
+                    return -1;
+                }
+                snprintf(thread->regex, sizeof(thread->regex), "%s",
+                         thread_regex);
+                if (strcmp(thread_regex, "/MAIN_THREAD/") != 0 &&
+                    validate_regex(thread_regex, "thread") < 0)
+                    return -1;
+                const char *ac_str = NULL;
+                parse_string_field(thread_obj, "ac", &ac_str);
+                if (ac_str && ac_str[0] != '\0') {
+                    thread->affinity_index =
+                        find_affinity_profile(&cfg->sched, ac_str);
+                    if (thread->affinity_index < 0) {
+                        log_error("sched.rules[%d].rules[%d] references "
+                                  "unknown affinity '%s'", i, j, ac_str);
+                        return -1;
+                    }
+                    snprintf(thread->affinity_name,
+                             sizeof(thread->affinity_name), "%s", ac_str);
+                }
+                const char *pc_str = NULL;
+                parse_string_field(thread_obj, "pc", &pc_str);
+                if (pc_str && pc_str[0] != '\0') {
+                    thread->priority_index =
+                        find_priority_profile(&cfg->sched, pc_str);
+                    if (thread->priority_index < 0) {
+                        log_error("sched.rules[%d].rules[%d] references "
+                                  "unknown priority '%s'", i, j, pc_str);
+                        return -1;
+                    }
+                    snprintf(thread->priority_name,
+                             sizeof(thread->priority_name), "%s", pc_str);
+                }
+                rule->nr_thread_rules++;
+            }
+        }
+        if (rule->nr_thread_rules == 0) {
+            log_error("sched.rules[%d] needs at least one thread rule", i);
+            return -1;
+        }
+        cfg->sched.nr_rules++;
+        log_debug("sched rule[%d]: %s regex=%s game=%d pinned=%d threads=%d",
+                  i, rule->name, rule->regex, rule->match_game, rule->pinned,
+                  rule->nr_thread_rules);
     }
     return 0;
 }
@@ -652,6 +936,11 @@ int config_load(Config *cfg, const char *path) {
     if (json_object_object_get_ex(modules_obj, "sched", &sched_obj)) {
         cfg->sched.enable = parse_bool_field(sched_obj, "enable", true);
         if (parse_sched_cpumasks(sched_obj, cfg) < 0) goto err;
+        if (parse_sched_affinity(sched_obj, cfg) < 0) goto err;
+        if (parse_sched_priorities(sched_obj, cfg) < 0) goto err;
+    }
+    if (parse_cgroup_config(modules_obj, cfg) < 0) goto err;
+    if (sched_obj) {
         if (parse_sched_rules(sched_obj, cfg) < 0) goto err;
     }
     if (resolve_power_model_cpumasks(cfg) < 0) goto err;
@@ -659,9 +948,11 @@ int config_load(Config *cfg, const char *path) {
     if (parse_initials(root, cfg) < 0)           goto err;
 
     json_object_put(root);
-    log_info("Config loaded: %s by %s (%d clusters, %d knobs, %d rules)",
+    log_info("Config loaded: %s by %s (%d clusters, %d knobs, %d rules, "
+             "%d cgroup classes)",
              cfg->meta_name, cfg->meta_author,
-             cfg->cpu.nr_clusters, cfg->sysfs.nr_knobs, cfg->sched.nr_rules);
+             cfg->cpu.nr_clusters, cfg->sysfs.nr_knobs, cfg->sched.nr_rules,
+             cfg->cgroup.nr_classes);
     return 0;
 
 err:
@@ -743,8 +1034,35 @@ int config_validate(const Config *cfg) {
         return -1;
     }
 
-    log_info("Config validation passed (%d clusters, %d modes)",
-             cfg->cpu.nr_clusters, MODE_NUM);
+    if (cfg->sched.enable &&
+        (cfg->sched.nr_cpumasks <= 0 ||
+         cfg->sched.nr_affinity_profiles <= 0 ||
+         cfg->sched.nr_priority_profiles <= 0 ||
+         cfg->sched.nr_rules <= 0)) {
+        log_error("Validation failed: enabled sched module needs cpumasks, "
+                  "affinity/prio profiles and process rules");
+        return -1;
+    }
+
+    if (cfg->cgroup.enable) {
+        if (!cfg->sched.enable) {
+            log_error("Validation failed: cgroup module requires sched module");
+            return -1;
+        }
+        if (strcmp(cfg->cgroup.backend, "systemd") != 0) {
+            log_error("Validation failed: unsupported cgroup backend '%s'",
+                      cfg->cgroup.backend);
+            return -1;
+        }
+        if (cfg->cgroup.nr_classes <= 0) {
+            log_error("Validation failed: enabled cgroup module needs classes");
+            return -1;
+        }
+    }
+
+    log_info("Config validation passed (%d clusters, %d modes, sched=%d, "
+             "cgroup=%d)", cfg->cpu.nr_clusters, MODE_NUM,
+             cfg->sched.enable, cfg->cgroup.enable);
     return 0;
 }
 

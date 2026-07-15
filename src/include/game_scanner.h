@@ -2,6 +2,7 @@
 #define UPERF_GAME_SCANNER_H
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <sys/types.h>
 #include "config.h"
 
@@ -12,6 +13,7 @@
 /* Detected process entry */
 typedef struct {
     pid_t  pid;
+    uint64_t start_time;       /* /proc/[pid]/stat field 22 */
     char   comm[16];           /* /proc/[pid]/comm */
     char   cmdline[CMDLINE_MAX]; /* /proc/[pid]/cmdline (null-separated) */
     bool   is_game;            /* matched as a game process */

@@ -24,6 +24,7 @@ struct DbusManager {
     double             loads[DBUS_MAX_CPUS];
     int                nr_loads;
     gboolean           heavy_load;
+    pid_t              active_pid;
 
     /* Bus connection for signal emission */
     GDBusConnection  *bus_conn;
@@ -47,6 +48,8 @@ struct DbusManager {
     void               *set_game_mode_ud;
     DbusSetManualFreqFunc set_manual_freq_cb;
     void               *set_manual_freq_ud;
+    DbusSetActivePidFunc set_active_pid_cb;
+    void               *set_active_pid_ud;
 
     /* Manual frequency overrides */
     gint64             manual_freq[5];
@@ -85,6 +88,9 @@ static const gchar introspection_xml[] =
     "    <property name=\"ManualFreqOverride\" type=\"ax\" access=\"read\">\n"
     "      <annotation name=\"org.freedesktop.DBus.Property.EmitsChangedSignal\" value=\"false\"/>\n"
     "    </property>\n"
+    "    <property name=\"ActiveProcess\" type=\"i\" access=\"read\">\n"
+    "      <annotation name=\"org.freedesktop.DBus.Property.EmitsChangedSignal\" value=\"true\"/>\n"
+    "    </property>\n"
     "    <method name=\"SetMode\">\n"
     "      <arg direction=\"in\" type=\"s\" name=\"mode\"/>\n"
     "      <arg direction=\"out\" type=\"b\" name=\"success\"/>\n"
@@ -103,6 +109,10 @@ static const gchar introspection_xml[] =
     "      <arg direction=\"in\" type=\"x\" name=\"freq_hz\"/>\n"
     "      <arg direction=\"out\" type=\"b\" name=\"success\"/>\n"
     "    </method>\n"
+    "    <method name=\"SetActiveProcess\">\n"
+    "      <arg direction=\"in\" type=\"i\" name=\"pid\"/>\n"
+    "      <arg direction=\"out\" type=\"b\" name=\"success\"/>\n"
+    "    </method>\n"
     "    <signal name=\"ModeChanged\">\n"
     "      <arg type=\"s\" name=\"mode\"/>\n"
     "    </signal>\n"
@@ -119,6 +129,9 @@ static const gchar introspection_xml[] =
     "    <signal name=\"ManualFreqChanged\">\n"
     "      <arg type=\"i\" name=\"cluster\"/>\n"
     "      <arg type=\"x\" name=\"freq_hz\"/>\n"
+    "    </signal>\n"
+    "    <signal name=\"ActiveProcessChanged\">\n"
+    "      <arg type=\"i\" name=\"pid\"/>\n"
     "    </signal>\n"
     "  </interface>\n"
     "</node>";
@@ -258,6 +271,16 @@ static void handle_method_call(GDBusConnection      *connection,
         g_dbus_method_invocation_return_value(invocation,
             g_variant_new("(b)", ok));
         return;
+    } else if (strcmp(method_name, "SetActiveProcess") == 0) {
+        DbusManager *mgr = (DbusManager *)user_data;
+        int pid_in = 0;
+        g_variant_get(parameters, "(i)", &pid_in);
+        gboolean ok = pid_in >= 0 && mgr->set_active_pid_cb &&
+            mgr->set_active_pid_cb((pid_t)pid_in, mgr->set_active_pid_ud);
+        if (ok) dbus_manager_set_active_pid(mgr, (pid_t)pid_in);
+        g_dbus_method_invocation_return_value(invocation,
+            g_variant_new("(b)", ok));
+        return;
     }
     g_dbus_method_invocation_return_error(
         invocation, G_DBUS_ERROR, G_DBUS_ERROR_UNKNOWN_METHOD,
@@ -357,6 +380,8 @@ static GVariant *handle_get_property(GDBusConnection *connection,
         return on_get_thermal_state(mgr);
     if (strcmp(property_name, "ManualFreqOverride") == 0)
         return on_get_manual_freq_override(mgr);
+    if (strcmp(property_name, "ActiveProcess") == 0)
+        return g_variant_new_int32(mgr->active_pid);
 
     g_set_error(error, G_DBUS_ERROR, G_DBUS_ERROR_UNKNOWN_PROPERTY,
                 "Unknown property %s", property_name);
@@ -658,6 +683,25 @@ void dbus_manager_set_manual_freq_handler(DbusManager *mgr,
     if (!mgr) return;
     mgr->set_manual_freq_cb = callback;
     mgr->set_manual_freq_ud = user_data;
+}
+
+void dbus_manager_set_active_pid_handler(DbusManager *mgr,
+                                         DbusSetActivePidFunc callback,
+                                         void *user_data) {
+    if (!mgr) return;
+    mgr->set_active_pid_cb = callback;
+    mgr->set_active_pid_ud = user_data;
+}
+
+void dbus_manager_set_active_pid(DbusManager *mgr, pid_t pid) {
+    if (!mgr || pid < 0 || mgr->active_pid == pid) return;
+    mgr->active_pid = pid;
+    dbus_emit_signal(mgr, "ActiveProcessChanged",
+                     g_variant_new("(i)", (gint)pid));
+}
+
+pid_t dbus_manager_get_active_pid(const DbusManager *mgr) {
+    return mgr ? mgr->active_pid : 0;
 }
 
 void dbus_manager_set_thermal_state(DbusManager *mgr, int max_temp_millidegC,

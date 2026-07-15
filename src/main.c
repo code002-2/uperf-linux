@@ -9,6 +9,8 @@
 #include "frequency_controller.h"
 #include "frequency_state.h"
 #include "game_scanner.h"
+#include "task_scheduler.h"
+#include "cgroup_manager.h"
 #include "thermal.h"
 #include "dbus_interface.h"
 #include "perapp_config.h"
@@ -33,6 +35,8 @@ static InputMonitor *g_im = NULL;
 static SysfsWriter *g_writer = NULL;
 static HeavyLoadDetector *g_detector = NULL;
 static GameScanner *g_scanner = NULL;
+static TaskScheduler *g_task_scheduler = NULL;
+static CgroupManager *g_cgroup_manager = NULL;
 static DbusManager *g_dbus = NULL;
 static ThermalManager *g_thermal = NULL;
 static volatile sig_atomic_t g_running = 1;
@@ -61,8 +65,12 @@ static int g_nr_cpu_targets;
 static bool g_automatic_frequency_enabled;
 static PowerMode g_requested_mode = MODE_BALANCE;
 static PowerMode g_last_detected_app_mode = MODE_NUM;
+static GameProcess g_game_results[MAX_GAMES];
+static int g_nr_game_results;
 
 #define FREQUENCY_STATE_FILE "/run/uperf-linux/frequency-state"
+#define SCHEDULER_STATE_FILE "/run/uperf-linux/scheduler-state"
+#define CGROUP_STATE_FILE "/run/uperf-linux/cgroup-state"
 
 static gint64 parse_sysfs_number(const char *value) {
     if (!value) return -1;
@@ -584,6 +592,12 @@ static gboolean dbus_game_mode_handler(pid_t pid, const char *app_name,
                                      comm, mode) == 0;
 }
 
+static gboolean dbus_active_pid_handler(pid_t pid, void *user_data) {
+    (void)user_data;
+    return g_task_scheduler &&
+        task_scheduler_set_active_pid(g_task_scheduler, pid) == 0;
+}
+
 static const char *power_mode_to_string(PowerMode mode) {
     switch (mode) {
         case MODE_POWERSAVE: return "powersave";
@@ -730,6 +744,8 @@ static gboolean reload_configuration(void) {
 
     InputMonitor *next_input = create_input_monitor(&next_config);
     ThermalManager *next_thermal = create_thermal_manager(&next_config);
+    pid_t active_pid =
+        task_scheduler_get_requested_active_pid(g_task_scheduler);
 
     /* Release all limits using the writer and originals belonging to the old
      * configuration before swapping the live component set. */
@@ -748,16 +764,36 @@ static gboolean reload_configuration(void) {
     InputMonitor *old_input = g_im;
     ThermalManager *old_thermal = g_thermal;
 
+    /* Scheduling state is tied to parsed rules. Restore the old policy before
+     * atomically installing managers built from the new configuration. */
+    cgroup_manager_free(g_cgroup_manager);
+    g_cgroup_manager = NULL;
+    task_scheduler_free(g_task_scheduler);
+    g_task_scheduler = NULL;
+
     g_config = next_config;
     g_sm = next_sm;
     g_writer = next_writer;
     g_im = next_input;
     g_thermal = next_thermal;
+    g_task_scheduler = task_scheduler_new(&g_config, SCHEDULER_STATE_FILE);
+    g_cgroup_manager = cgroup_manager_new(&g_config, CGROUP_STATE_FILE);
+    if (!g_task_scheduler || !g_cgroup_manager ||
+        (g_config.cgroup.enable &&
+         !cgroup_manager_is_available(g_cgroup_manager))) {
+        log_fatal("Configuration reload could not initialize required "
+                  "sched/cgroup managers; shutting down safely");
+        g_running = 0;
+    } else if (active_pid > 0) {
+        task_scheduler_set_active_pid(g_task_scheduler, active_pid);
+    }
     discover_manual_frequency_targets();
 
     if (g_scanner) {
         game_scanner_perapp_scan(g_scanner, g_config.switcher.perapp_file);
         game_scanner_scan(g_scanner);
+        g_nr_game_results = game_scanner_get_results(
+            g_scanner, g_game_results, MAX_GAMES);
     }
     if (g_dbus) {
         dbus_manager_set_scene(g_dbus,
@@ -784,6 +820,10 @@ static int event_loop(void) {
     int poll_interval_ms = 50;  /* Base poll interval */
     bool previous_heavy = false;
     SceneState published_scene = state_machine_get_scene(g_sm);
+    SceneState scheduling_scene = published_scene;
+    gint64 last_policy_update_us = 0;
+    gint64 last_sched_error_log_us = 0;
+    gint64 last_cgroup_error_log_us = 0;
 
     while (g_running) {
         /* Dispatch D-Bus calls and GLib timers from the polling loop. */
@@ -898,6 +938,7 @@ static int event_loop(void) {
         if (g_sm) {
             state_machine_tick(g_sm);
             SceneState current_scene = state_machine_get_scene(g_sm);
+            scheduling_scene = current_scene;
             if (current_scene != published_scene) {
                 if (g_dbus)
                     dbus_manager_set_scene(g_dbus,
@@ -923,12 +964,13 @@ static int event_loop(void) {
             if (g_scanner) {
                 game_scanner_scan(g_scanner);
                 /* Update DBus with game list + per-app modes */
-                GameProcess results[MAX_GAMES];
-                int nr = game_scanner_get_results(g_scanner, results, MAX_GAMES);
+                g_nr_game_results = game_scanner_get_results(
+                    g_scanner, g_game_results, MAX_GAMES);
+                int nr = g_nr_game_results;
                 PowerMode detected_mode = MODE_BALANCE;
                 for (int i = 0; i < nr; i++) {
                     const char *app_mode = game_scanner_get_app_mode(
-                        g_scanner, results[i].comm);
+                        g_scanner, g_game_results[i].comm);
                     if (strcmp(app_mode, "performance") == 0 ||
                         strcmp(app_mode, "fast") == 0) {
                         detected_mode = MODE_PERFORMANCE;
@@ -948,13 +990,16 @@ static int event_loop(void) {
                 if (g_dbus) {
                     GameProcessEntry dbus_games[MAX_GAMES];
                     for (int i = 0; i < nr; i++) {
-                        dbus_games[i].pid = results[i].pid;
-                        dbus_games[i].comm = g_strdup(results[i].comm);
-                        dbus_games[i].cmdline = g_strdup(results[i].cmdline);
-                        dbus_games[i].package = g_strdup(results[i].package);
+                        dbus_games[i].pid = g_game_results[i].pid;
+                        dbus_games[i].comm = g_strdup(g_game_results[i].comm);
+                        dbus_games[i].cmdline = g_strdup(
+                            g_game_results[i].cmdline);
+                        dbus_games[i].package = g_strdup(
+                            g_game_results[i].package);
                         /* Look up per-app mode */
                         dbus_games[i].mode = g_strdup(
-                            game_scanner_get_app_mode(g_scanner, results[i].comm));
+                            game_scanner_get_app_mode(
+                                g_scanner, g_game_results[i].comm));
                     }
                     dbus_manager_update_games(g_dbus, dbus_games, nr);
                     for (int i = 0; i < nr; i++) {
@@ -963,6 +1008,41 @@ static int event_loop(void) {
                         g_free(dbus_games[i].package);
                         g_free(dbus_games[i].mode);
                     }
+                }
+            }
+        }
+
+        /* Apply process/thread scheduling at a bounded cadence. The task
+         * scheduler itself performs slower full process discovery and faster
+         * active-thread reconciliation. */
+        gint64 policy_now_us = g_get_monotonic_time();
+        if (last_policy_update_us == 0 ||
+            policy_now_us - last_policy_update_us >= 250000) {
+            last_policy_update_us = policy_now_us;
+            if (g_task_scheduler &&
+                task_scheduler_update(g_task_scheduler, g_game_results,
+                                      g_nr_game_results,
+                                      scheduling_scene) != 0 &&
+                (last_sched_error_log_us == 0 ||
+                 policy_now_us - last_sched_error_log_us >= 5000000)) {
+                log_warn("Task scheduling reconciliation reported errors");
+                last_sched_error_log_us = policy_now_us;
+            }
+            if (g_task_scheduler && g_dbus)
+                dbus_manager_set_active_pid(
+                    g_dbus, task_scheduler_get_active_pid(g_task_scheduler));
+            if (g_task_scheduler && g_cgroup_manager) {
+                TaskWorkload workloads[MAX_GAMES + MAX_RULES];
+                int nr_workloads = task_scheduler_get_workloads(
+                    g_task_scheduler, workloads,
+                    (int)(sizeof(workloads) / sizeof(workloads[0])));
+                if (nr_workloads >= 0 &&
+                    cgroup_manager_update(g_cgroup_manager, workloads,
+                                          nr_workloads) != 0 &&
+                    (last_cgroup_error_log_us == 0 ||
+                     policy_now_us - last_cgroup_error_log_us >= 5000000)) {
+                    log_warn("Cgroup reconciliation reported errors");
+                    last_cgroup_error_log_us = policy_now_us;
                 }
             }
         }
@@ -1075,6 +1155,26 @@ int main(int argc, char *argv[]) {
         /* Load per-app mode rules */
         game_scanner_perapp_scan(g_scanner, g_config.switcher.perapp_file);
         game_scanner_scan(g_scanner);
+        g_nr_game_results = game_scanner_get_results(
+            g_scanner, g_game_results, MAX_GAMES);
+    }
+
+    g_task_scheduler = task_scheduler_new(&g_config, SCHEDULER_STATE_FILE);
+    g_cgroup_manager = cgroup_manager_new(&g_config, CGROUP_STATE_FILE);
+    if (!g_task_scheduler || !g_cgroup_manager ||
+        (g_config.cgroup.enable &&
+         !cgroup_manager_is_available(g_cgroup_manager))) {
+        log_fatal("Failed to initialize required sched/cgroup managers");
+        cgroup_manager_free(g_cgroup_manager);
+        task_scheduler_free(g_task_scheduler);
+        game_scanner_free(g_scanner);
+        input_monitor_free(g_im);
+        heavyload_detector_free(g_detector);
+        sysfs_writer_free(g_writer);
+        state_machine_free(g_sm);
+        config_free(&g_config);
+        log_shutdown();
+        return 1;
     }
 
     /* Initialize DBus manager */
@@ -1086,6 +1186,8 @@ int main(int argc, char *argv[]) {
                                            dbus_game_mode_handler, NULL);
         dbus_manager_set_manual_freq_handler(g_dbus,
                                              dbus_manual_freq_handler, NULL);
+        dbus_manager_set_active_pid_handler(g_dbus,
+                                            dbus_active_pid_handler, NULL);
         log_info("DBus manager initialized on system bus");
     } else {
         log_warn("Failed to initialize DBus manager (GUI will not be able to control daemon)");
@@ -1111,6 +1213,8 @@ int main(int argc, char *argv[]) {
     }
     dbus_manager_free(g_dbus);
     thermal_manager_free(g_thermal);
+    cgroup_manager_free(g_cgroup_manager);
+    task_scheduler_free(g_task_scheduler);
     game_scanner_free(g_scanner);
     input_monitor_free(g_im);
     heavyload_detector_free(g_detector);

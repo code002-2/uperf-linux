@@ -21,7 +21,12 @@ RuntimeDirectoryPreserve=restart
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/etc/uperf-linux /run/uperf-linux
-ProtectHome=yes
+# ProtectHome=yes would also hide /run/user, where user-manager control
+# sockets live. Hide actual home directories explicitly while exposing the
+# runtime tree read-only.
+ProtectHome=no
+InaccessiblePaths=/home /root
+ReadOnlyPaths=/run/user
 
 Slice=system.slice
 

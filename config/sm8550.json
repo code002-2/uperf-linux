@@ -87,7 +87,7 @@
     },
 
     "sched": {
-      "enable": false,
+      "enable": true,
       "cpumask": {
         "all": [0,1,2,3,4,5,6,7],
         "prime": [7],
@@ -108,47 +108,72 @@
         "bg":    { "bg": -3, "fg": 139, "idle": 139, "touch": 139, "boost": 139 },
         "norm":  { "bg": -1, "fg": -1, "idle": 120, "touch": 120, "boost": 130 },
         "coop":  { "bg": -3, "fg": 124, "idle": 122, "touch": 122, "boost": 130 },
-        "ui":    { "bg": -3, "fg": 120, "idle": 110, "touch": 98, "boost": 116 },
+        "ui":    { "bg": -3, "fg": 115, "idle": 110, "touch": 105, "boost": 105 },
         "rtusr": { "bg": 98, "fg": 98, "idle": 97, "touch": 97, "boost": 98 }
       },
       "rules": [
         {
           "name": "Display server / WM",
-          "regex": "gnome-shell|kwin_wayland|sway|weston-launch|xwayland|Xorg",
+          "regex": "gnome-shell|kwin_wayland|sway|weston|Xwayland|Xorg",
           "pinned": true,
-          "rules": [{"k": ".*", "ac": "ui", "pc": "rtusr"}]
+          "cgroup": "system",
+          "rules": [
+            {"k": "/MAIN_THREAD/", "ac": "ui", "pc": "ui"},
+            {"k": "^(RenderThread|Compositor|mutter|Meta|KMS|Wayland|Xwayland)", "ac": "crit", "pc": "ui"},
+            {"k": ".*", "ac": "norm", "pc": "auto"}
+          ]
         },
         {
-          "name": "Game engine main thread",
-          "regex": "^(UnityMain|GameThread|RenderThread|GLThread|GLESThread)",
-          "pinned": true,
-          "rules": [{"k": ".*", "ac": "gtmain", "pc": "auto"}]
-        },
-        {
-          "name": "Game worker threads",
-          "regex": "^(Worker|TaskGraph|RHIThread|Job|ThreadPool|Async|IOThread)",
-          "pinned": false,
-          "rules": [{"k": ".*", "ac": "gtcoop", "pc": "auto"}]
-        },
-        {
-          "name": "Browser renderer",
-          "regex": "^(CrRendererMain|Compositor|Viz|gpu-compute|gpu-sandbox)",
-          "pinned": false,
-          "rules": [{"k": ".*", "ac": "ui", "pc": "ui"}]
-        },
-        {
-          "name": "Background threads",
-          "regex": "^(Jit|HeapTask|Finalizer|ReferenceQueue|GC|pool-|glide-|launcher-|Fresco|Download)",
-          "pinned": false,
-          "rules": [{"k": ".*", "ac": "bg", "pc": "auto"}]
-        },
-        {
-          "name": "Default",
+          "name": "Detected game",
           "regex": ".*",
+          "game": true,
           "pinned": false,
-          "rules": [{"k": ".*", "ac": "norm", "pc": "auto"}]
+          "cgroup": "game",
+          "rules": [
+            {"k": "/MAIN_THREAD/", "ac": "gtmain", "pc": "ui"},
+            {"k": "^(UnityMain|GameThread|RenderThread|GLThread|GLESThread|RHIThread)", "ac": "gtmain", "pc": "ui"},
+            {"k": "^(Worker|TaskGraph|Job|ThreadPool|Async|IOThread)", "ac": "gtcoop", "pc": "coop"},
+            {"k": "^(Jit|HeapTask|Finalizer|ReferenceQueue|GC|pool-|Download)", "ac": "bg", "pc": "bg"},
+            {"k": ".*", "ac": "norm", "pc": "norm"}
+          ]
+        },
+        {
+          "name": "Active browser",
+          "regex": "chromium|chrome|firefox|WebKit|electron|code",
+          "pinned": false,
+          "cgroup": "system",
+          "rules": [
+            {"k": "/MAIN_THREAD/", "ac": "ui", "pc": "ui"},
+            {"k": "^(CrRendererMain|Compositor|Viz|gpu-compute|gpu-sandbox)", "ac": "ui", "pc": "ui"},
+            {"k": ".*", "ac": "norm", "pc": "norm"}
+          ]
         }
       ]
+    },
+
+    "cgroup": {
+      "enable": true,
+      "backend": "systemd",
+      "classes": {
+        "game": {
+          "cpumask": "all",
+          "cpuWeight": 200,
+          "uclampMin": 128,
+          "uclampMax": 1024
+        },
+        "system": {
+          "cpumask": "all",
+          "cpuWeight": 150,
+          "uclampMin": 64,
+          "uclampMax": 1024
+        },
+        "background": {
+          "cpumask": "efficiency",
+          "cpuWeight": 25,
+          "uclampMin": 0,
+          "uclampMax": 512
+        }
+      }
     }
   },
 

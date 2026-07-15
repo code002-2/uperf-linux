@@ -19,6 +19,7 @@ static void print_usage(const char *prog) {
         "  status                         Show daemon and scheduler status\n"
         "  mode <name>                    Set balance|powersave|performance\n"
         "  game-list                      List detected game processes\n"
+        "  active-pid <pid|0>             Select/clear the active workload\n"
         "  set-freq <cluster> <freq_hz>   Set/release a manual override\n"
         "      cluster: -1=GPU, 0=Prime, 1=Perf, 2=Eff, 3=all CPUs\n"
         "      freq_hz: 0 releases the override\n"
@@ -102,12 +103,14 @@ static int cmd_status(void) {
     const char *scene = "unknown";
     gboolean heavy = FALSE;
     gint32 temperature = 0;
+    gint32 active_pid = 0;
     g_variant_lookup(properties, "CurrentMode", "&s", &mode);
     g_variant_lookup(properties, "CurrentScene", "&s", &scene);
     g_variant_lookup(properties, "IsHeavyLoad", "b", &heavy);
     g_variant_lookup(properties, "MaxTemperature", "i", &temperature);
-    printf("Power mode: %s\nScene: %s\nHeavy load: %s\n",
-           mode, scene, heavy ? "yes" : "no");
+    g_variant_lookup(properties, "ActiveProcess", "i", &active_pid);
+    printf("Power mode: %s\nScene: %s\nHeavy load: %s\nActive PID: %d\n",
+           mode, scene, heavy ? "yes" : "no", active_pid);
     if (temperature > 0)
         printf("Max temperature: %.1f C\n", temperature / 1000.0);
     printf("\n");
@@ -209,6 +212,35 @@ static int cmd_set_freq(const char *cluster_text, const char *freq_text) {
     return 0;
 }
 
+static int cmd_active_pid(const char *pid_text) {
+    char *end = NULL;
+    errno = 0;
+    long pid = strtol(pid_text, &end, 10);
+    if (errno || end == pid_text || *end || pid < 0 || pid > G_MAXINT32) {
+        fprintf(stderr, "Invalid PID: %s\n", pid_text);
+        return 1;
+    }
+    GDBusConnection *connection = connect_daemon();
+    if (!connection) return 1;
+    GVariant *reply = daemon_call(connection, "SetActiveProcess",
+                                  g_variant_new("(i)", (gint)pid),
+                                  G_VARIANT_TYPE("(b)"));
+    g_object_unref(connection);
+    if (!reply) return 1;
+    gboolean success = FALSE;
+    g_variant_get(reply, "(b)", &success);
+    g_variant_unref(reply);
+    if (!success) {
+        fprintf(stderr, "Daemon rejected active PID %ld\n", pid);
+        return 1;
+    }
+    if (pid == 0)
+        printf("Active workload selection cleared\n");
+    else
+        printf("Active workload set to PID %ld\n", pid);
+    return 0;
+}
+
 static int cmd_show_freqs(void) {
     GDBusConnection *connection = connect_daemon();
     if (!connection) return 1;
@@ -241,6 +273,9 @@ int main(int argc, char **argv) {
         return argc == 3 ? cmd_mode(argv[2]) : (print_usage(argv[0]), 1);
     if (strcmp(command, "set-freq") == 0)
         return argc == 4 ? cmd_set_freq(argv[2], argv[3])
+                         : (print_usage(argv[0]), 1);
+    if (strcmp(command, "active-pid") == 0)
+        return argc == 3 ? cmd_active_pid(argv[2])
                          : (print_usage(argv[0]), 1);
     if (strcmp(command, "detect") == 0) {
         execl("/usr/bin/uperf-wizard", "uperf-wizard", "detect",

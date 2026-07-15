@@ -49,6 +49,7 @@
     <property name="MaxTemperature" type="i" access="read"/>
     <property name="ThermalState" type="s" access="read"/>
     <property name="ManualFreqOverride" type="ax" access="read"/>
+    <property name="ActiveProcess" type="i" access="read"/>
 
     <!-- ============================================================
          METHODS
@@ -78,6 +79,11 @@
       <arg direction="out" type="b" name="success"/>
     </method>
 
+    <method name="SetActiveProcess">
+      <arg direction="in" type="i" name="pid"/>
+      <arg direction="out" type="b" name="success"/>
+    </method>
+
     <!-- ============================================================
          SIGNALS
          ============================================================ -->
@@ -102,6 +108,10 @@
     <signal name="ManualFreqChanged">
       <arg type="i" name="cluster"/>
       <arg type="x" name="freq_hz"/>
+    </signal>
+
+    <signal name="ActiveProcessChanged">
+      <arg type="i" name="pid"/>
     </signal>
 
   </interface>

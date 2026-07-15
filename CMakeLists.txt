@@ -46,6 +46,7 @@ set(UPERF_SOURCES
     src/frequency_state.c
     src/state_machine.c
     src/input_monitor.c
+    src/task_scheduler.c
     src/cgroup_manager.c
     src/heavyload_detector.c
     src/game_scanner.c
@@ -64,6 +65,7 @@ set(UPERF_HEADERS
     src/include/frequency_state.h
     src/include/state_machine.h
     src/include/input_monitor.h
+    src/include/task_scheduler.h
     src/include/cgroup_manager.h
     src/include/heavyload_detector.h
     src/include/game_scanner.h
@@ -195,6 +197,32 @@ if(BUILD_TESTS)
     )
     target_link_libraries(test_heavyload_detector PRIVATE pthread rt)
 
+    add_executable(test_task_scheduler
+        tests/test_task_scheduler.c
+        src/task_scheduler.c
+        src/log.c
+    )
+    target_include_directories(test_task_scheduler PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/include
+    )
+    target_link_libraries(test_task_scheduler PRIVATE pthread rt)
+
+    if(LIBSYSTEMD_LIBRARY AND LIBSYSTEMD_INCLUDE_DIR)
+        add_executable(test_cgroup_manager
+            tests/test_cgroup_manager.c
+            src/cgroup_manager.c
+            src/log.c
+        )
+        target_include_directories(test_cgroup_manager PRIVATE
+            ${LIBSYSTEMD_INCLUDE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/include
+        )
+        target_compile_definitions(test_cgroup_manager PRIVATE
+            HAVE_LIBSYSTEMD=1)
+        target_link_libraries(test_cgroup_manager PRIVATE
+            ${LIBSYSTEMD_LIBRARY} pthread)
+    endif()
+
     add_executable(test_dbus_interface
         tests/test_dbus_interface.c
         src/log.c
@@ -236,6 +264,11 @@ if(BUILD_TESTS)
     add_test(NAME thermal COMMAND test_thermal)
     add_test(NAME input_monitor COMMAND test_input_monitor)
     add_test(NAME heavyload_detector COMMAND test_heavyload_detector)
+    add_test(NAME task_scheduler COMMAND test_task_scheduler)
+    if(TARGET test_cgroup_manager)
+        add_test(NAME cgroup_manager COMMAND test_cgroup_manager)
+        set_tests_properties(cgroup_manager PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
     add_test(NAME dbus_interface COMMAND test_dbus_interface)
     add_test(NAME wizard_detect COMMAND uperf-wizard detect --output
         ${CMAKE_CURRENT_BINARY_DIR}/wizard-detected.json)

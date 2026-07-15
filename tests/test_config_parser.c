@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <json-c/json.h>
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -222,11 +223,114 @@ TEST(test_load_sched_rules) {
     ASSERT_OK(ret, "config_load for rules test");
     ASSERT_GT(cfg.sched.nr_rules, 0, "rules count > 0");
     ASSERT_EQ(cfg.sched.nr_cpumasks, 4, "cpumask group count");
+    ASSERT_EQ(cfg.sched.enable, 1, "sched enabled");
+    ASSERT_EQ(cfg.sched.nr_affinity_profiles, 7, "affinity profile count");
+    ASSERT_EQ(cfg.sched.nr_priority_profiles, 6, "priority profile count");
     ASSERT_EQ((int)cfg.sched.cpumasks[0].mask, 0xff, "all CPU mask");
     /* First rule should have a name and regex */
     ASSERT_GT(strlen(cfg.sched.rules[0].name), 0, "rule[0] has name");
     ASSERT_GT(strlen(cfg.sched.rules[0].regex), 0, "rule[0] has regex");
+    ASSERT_EQ(cfg.sched.rules[0].nr_thread_rules, 3,
+              "display thread rule count");
+    ASSERT_EQ(cfg.sched.rules[1].match_game, 1, "game selector parsed");
+    ASSERT_EQ(cfg.sched.rules[1].nr_thread_rules, 5,
+              "game thread rule count");
+    ASSERT_EQ(cfg.sched.rules[1].thread_rules[0].affinity_index, 6,
+              "gtmain affinity reference resolved");
+    ASSERT_EQ(cfg.cgroup.enable, 1, "cgroup enabled");
+    ASSERT_EQ(cfg.cgroup.nr_classes, 3, "cgroup class count");
+    ASSERT_EQ(cfg.cgroup.classes[0].cpu_weight, 200, "game CPU weight");
+    ASSERT_EQ((int)cfg.cgroup.classes[2].cpu_mask, 0x07,
+              "background CPU mask");
     ASSERT_PASS("sched rules parsed correctly");
+}
+
+static struct json_object *load_json_for_mutation(void) {
+    struct json_object *root = json_object_from_file("config/sm8550.json");
+    return root;
+}
+
+static int write_mutated_json(struct json_object *root, const char *suffix,
+                              char *path, size_t path_size) {
+    snprintf(path, path_size, "/tmp/uperf-config-%d-%s.json", getpid(),
+             suffix);
+    return json_object_to_file_ext(path, root, JSON_C_TO_STRING_PRETTY);
+}
+
+TEST(test_reject_invalid_sched_priority) {
+    struct json_object *root = load_json_for_mutation();
+    if (!root) { printf("FAIL (cannot load fixture)\n"); tests_failed++; return; }
+    struct json_object *modules, *sched, *prio, *rtusr;
+    json_object_object_get_ex(root, "modules", &modules);
+    json_object_object_get_ex(modules, "sched", &sched);
+    json_object_object_get_ex(sched, "prio", &prio);
+    json_object_object_get_ex(prio, "rtusr", &rtusr);
+    json_object_object_add(rtusr, "bg", json_object_new_int(99));
+    char path[160];
+    write_mutated_json(root, "bad-prio", path, sizeof(path));
+    json_object_put(root);
+    Config cfg;
+    int ret = config_load(&cfg, path);
+    unlink(path);
+    ASSERT_FAIL(ret, "priority 99 must be rejected");
+    ASSERT_PASS("invalid priority rejected");
+}
+
+TEST(test_reject_unknown_affinity_cpumask) {
+    struct json_object *root = load_json_for_mutation();
+    if (!root) { printf("FAIL (cannot load fixture)\n"); tests_failed++; return; }
+    struct json_object *modules, *sched, *affinity, *ui;
+    json_object_object_get_ex(root, "modules", &modules);
+    json_object_object_get_ex(modules, "sched", &sched);
+    json_object_object_get_ex(sched, "affinity", &affinity);
+    json_object_object_get_ex(affinity, "ui", &ui);
+    json_object_object_add(ui, "touch", json_object_new_string("missing"));
+    char path[160];
+    write_mutated_json(root, "bad-mask", path, sizeof(path));
+    json_object_put(root);
+    Config cfg;
+    int ret = config_load(&cfg, path);
+    unlink(path);
+    ASSERT_FAIL(ret, "unknown affinity cpumask must be rejected");
+    ASSERT_PASS("unknown affinity cpumask rejected");
+}
+
+TEST(test_reject_invalid_sched_regex) {
+    struct json_object *root = load_json_for_mutation();
+    if (!root) { printf("FAIL (cannot load fixture)\n"); tests_failed++; return; }
+    struct json_object *modules, *sched, *rules, *first;
+    json_object_object_get_ex(root, "modules", &modules);
+    json_object_object_get_ex(modules, "sched", &sched);
+    json_object_object_get_ex(sched, "rules", &rules);
+    first = json_object_array_get_idx(rules, 0);
+    json_object_object_add(first, "regex", json_object_new_string("["));
+    char path[160];
+    write_mutated_json(root, "bad-regex", path, sizeof(path));
+    json_object_put(root);
+    Config cfg;
+    int ret = config_load(&cfg, path);
+    unlink(path);
+    ASSERT_FAIL(ret, "invalid process regex must be rejected");
+    ASSERT_PASS("invalid regex rejected");
+}
+
+TEST(test_reject_invalid_cgroup_class) {
+    struct json_object *root = load_json_for_mutation();
+    if (!root) { printf("FAIL (cannot load fixture)\n"); tests_failed++; return; }
+    struct json_object *modules, *cgroup, *classes, *game;
+    json_object_object_get_ex(root, "modules", &modules);
+    json_object_object_get_ex(modules, "cgroup", &cgroup);
+    json_object_object_get_ex(cgroup, "classes", &classes);
+    json_object_object_get_ex(classes, "game", &game);
+    json_object_object_add(game, "cpuWeight", json_object_new_int(0));
+    char path[160];
+    write_mutated_json(root, "bad-cgroup", path, sizeof(path));
+    json_object_put(root);
+    Config cfg;
+    int ret = config_load(&cfg, path);
+    unlink(path);
+    ASSERT_FAIL(ret, "invalid cgroup weight must be rejected");
+    ASSERT_PASS("invalid cgroup class rejected");
 }
 
 /* Test: config_load parses switcher config */
@@ -290,6 +394,16 @@ TEST(test_validate_neg_power) {
     ASSERT_PASS("correctly rejects negative power");
 }
 
+TEST(test_validate_cgroup_requires_sched) {
+    Config cfg;
+    int ret = config_load(&cfg, "config/sm8550.json");
+    ASSERT_OK(ret, "load cgroup/sched fixture");
+    cfg.sched.enable = false;
+    ret = config_validate(&cfg);
+    ASSERT_FAIL(ret, "enabled cgroup must require sched classification");
+    ASSERT_PASS("cgroup without sched rejected");
+}
+
 int main(void) {
     printf("=== config_parser tests ===\n");
     log_init(UPERF_LOG_WARN, 0, NULL);
@@ -306,11 +420,16 @@ int main(void) {
     RUN_TEST(test_load_power_model);
     RUN_TEST(test_load_sysfs_knobs);
     RUN_TEST(test_load_sched_rules);
+    RUN_TEST(test_reject_invalid_sched_priority);
+    RUN_TEST(test_reject_unknown_affinity_cpumask);
+    RUN_TEST(test_reject_invalid_sched_regex);
+    RUN_TEST(test_reject_invalid_cgroup_class);
     RUN_TEST(test_load_switcher);
     RUN_TEST(test_load_input);
     RUN_TEST(test_load_initials);
     RUN_TEST(test_load_presets);
     RUN_TEST(test_validate_neg_power);
+    RUN_TEST(test_validate_cgroup_requires_sched);
 
     printf("\nResults: %d/%d passed (%d failed)\n",
            tests_passed, tests_run, tests_failed);

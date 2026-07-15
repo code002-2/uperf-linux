@@ -104,6 +104,13 @@ void dbus_manager_set_manual_freq_handler(DbusManager *mgr,
                                            DbusSetManualFreqFunc callback,
                                            void *user_data);
 
+typedef gboolean (*DbusSetActivePidFunc)(pid_t pid, void *user_data);
+void dbus_manager_set_active_pid_handler(DbusManager *mgr,
+                                         DbusSetActivePidFunc callback,
+                                         void *user_data);
+void dbus_manager_set_active_pid(DbusManager *mgr, pid_t pid);
+pid_t dbus_manager_get_active_pid(const DbusManager *mgr);
+
 /* Update thermal state information. */
 void dbus_manager_set_thermal_state(DbusManager *mgr, int max_temp_millidegC,
                                      const char *state_str);
