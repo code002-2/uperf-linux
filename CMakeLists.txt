@@ -175,6 +175,16 @@ if(BUILD_TESTS)
     )
     target_link_libraries(test_thermal PRIVATE pthread)
 
+    add_executable(test_input_monitor
+        tests/test_input_monitor.c
+        src/log.c
+        src/input_monitor.c
+    )
+    target_include_directories(test_input_monitor PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/include
+    )
+    target_link_libraries(test_input_monitor PRIVATE pthread m)
+
     add_executable(test_heavyload_detector
         tests/test_heavyload_detector.c
         src/log.c
@@ -224,6 +234,7 @@ if(BUILD_TESTS)
     add_test(NAME game_scanner COMMAND test_game_scanner)
     add_test(NAME perapp_config COMMAND test_perapp_config)
     add_test(NAME thermal COMMAND test_thermal)
+    add_test(NAME input_monitor COMMAND test_input_monitor)
     add_test(NAME heavyload_detector COMMAND test_heavyload_detector)
     add_test(NAME dbus_interface COMMAND test_dbus_interface)
     add_test(NAME wizard_detect COMMAND uperf-wizard detect --output

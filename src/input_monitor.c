@@ -66,11 +66,37 @@ struct InputMonitor {
     float screen_diagonal;
 };
 
-/* Calculate Euclidean distance between two points */
-static float dist(int32_t x1, int32_t y1, int32_t x2, int32_t y2) {
-    int dx = x2 - x1;
-    int dy = y2 - y1;
-    return sqrtf((float)(dx * dx + dy * dy));
+float input_monitor_distance(int32_t x1, int32_t y1,
+                             int32_t x2, int32_t y2) {
+    float dx = (float)x2 - (float)x1;
+    float dy = (float)y2 - (float)y1;
+    return hypotf(dx, dy);
+}
+
+EventType input_monitor_classify_release(
+    float distance_ratio, float swipe_thd,
+    int32_t start_x, int32_t start_y,
+    int screen_width, int screen_height,
+    float gesture_thd_x, float gesture_thd_y,
+    float elapsed_ms, float gesture_delay_time) {
+    if (distance_ratio <= swipe_thd) return EVT_TOUCH_UP;
+
+    bool from_edge = false;
+    if (screen_width > 0 && gesture_thd_x > 0.0f) {
+        float left = (float)screen_width * gesture_thd_x;
+        float right = (float)screen_width * (1.0f - gesture_thd_x);
+        from_edge = (float)start_x <= left || (float)start_x >= right;
+    }
+    if (!from_edge && screen_height > 0 && gesture_thd_y > 0.0f) {
+        float top = (float)screen_height * gesture_thd_y;
+        float bottom = (float)screen_height * (1.0f - gesture_thd_y);
+        from_edge = (float)start_y <= top || (float)start_y >= bottom;
+    }
+
+    bool within_gesture_time = gesture_delay_time <= 0.0f ||
+        (elapsed_ms >= 0.0f &&
+         elapsed_ms <= gesture_delay_time * 1000.0f);
+    return from_edge && within_gesture_time ? EVT_GESTURE : EVT_SWIPE;
 }
 
 /* Check if a device file descriptor corresponds to a touchscreen */
@@ -365,7 +391,7 @@ int input_monitor_poll(InputMonitor *im, InputEvent *events, int max_events) {
                                im->tracker.last_y >= 0 &&
                                im->tracker.previous_x >= 0 &&
                                im->tracker.previous_y >= 0) {
-                        im->tracker.total_distance += dist(
+                        im->tracker.total_distance += input_monitor_distance(
                             im->tracker.previous_x, im->tracker.previous_y,
                             im->tracker.last_x, im->tracker.last_y);
                         im->tracker.previous_x = im->tracker.last_x;
@@ -379,35 +405,24 @@ int input_monitor_poll(InputMonitor *im, InputEvent *events, int max_events) {
                             im->tracker.touch_down = false;
                             float distance_ratio = im->tracker.total_distance /
                                                    im->screen_diagonal;
-                            float elapsed_ms = (float)(ts_ms -
-                                                       im->tracker.first_ts_ms);
+                            float elapsed_ms = ts_ms >= im->tracker.first_ts_ms
+                                ? (float)(ts_ms - im->tracker.first_ts_ms)
+                                : 0.0f;
                             float velocity = elapsed_ms > 0.0f
                                 ? im->tracker.total_distance /
                                   (elapsed_ms / 1000.0f) : 0.0f;
-                            bool from_edge =
-                                im->tracker.first_x <=
-                                    im->screen_width * im->gesture_thd_x ||
-                                im->tracker.first_x >=
-                                    im->screen_width * (1.0f - im->gesture_thd_x) ||
-                                im->tracker.first_y <=
-                                    im->screen_height * im->gesture_thd_y ||
-                                im->tracker.first_y >=
-                                    im->screen_height * (1.0f - im->gesture_thd_y);
-                            bool within_gesture_time =
-                                im->gesture_delay_time <= 0.0f ||
-                                elapsed_ms <= im->gesture_delay_time * 1000.0f;
-
                             InputEvent *out = &events[event_count++];
                             memset(out, 0, sizeof(*out));
                             out->distance_ratio = distance_ratio;
                             out->velocity = velocity;
                             out->start_x = im->tracker.first_x;
                             out->start_y = im->tracker.first_y;
-                            if (distance_ratio > im->swipe_thd)
-                                out->type = from_edge && within_gesture_time
-                                    ? EVT_GESTURE : EVT_SWIPE;
-                            else
-                                out->type = EVT_TOUCH_UP;
+                            out->type = input_monitor_classify_release(
+                                distance_ratio, im->swipe_thd,
+                                im->tracker.first_x, im->tracker.first_y,
+                                im->screen_width, im->screen_height,
+                                im->gesture_thd_x, im->gesture_thd_y,
+                                elapsed_ms, im->gesture_delay_time);
 
                             im->tracker.total_distance = 0.0f;
                             im->tracker.previous_x = -1;
