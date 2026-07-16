@@ -3,24 +3,23 @@ set -e
 
 case "$1" in
     configure)
-        # Create runtime directory
-        mkdir -p /run/uperf-linux
-        chmod 755 /run/uperf-linux
+        # Reload the D-Bus daemon so the updated policy takes effect.
+        systemctl reload dbus 2>/dev/null \
+            || systemctl reload dbus-broker 2>/dev/null || true
 
-        # Enable and start the daemon if not already running
+        systemctl daemon-reload 2>/dev/null || true
         if systemctl is-active --quiet uperf-linux.service 2>/dev/null; then
-            systemctl reload uperf-linux.service 2>/dev/null || true
-        else
-            systemctl enable uperf-linux.service 2>/dev/null || true
-            systemctl start uperf-linux.service 2>/dev/null || true
+            systemctl restart uperf-linux.service 2>/dev/null || true
         fi
 
-        # Set up permissions for sysfs access
-        # The daemon runs as root via systemd, so this is handled
-
-        echo "uperf-linux GUI installed successfully."
-        echo "Start the daemon: sudo systemctl start uperf-linux"
+        echo "uperf-linux installed successfully."
+        echo "The daemon was not enabled automatically; review the generated device config first."
+        echo "Start daemon: sudo systemctl start uperf-linux"
+        echo "Control: uperfctl status"
         echo "Launch GUI: uperf-gui"
+        echo
+        echo "Active desktop users can change normal modes through Polkit without re-login."
+        echo "Manual frequency overrides and config reloads request administrator authentication."
         ;;
 
     abort-upgrade|abort-remove|abort-deconfigure)

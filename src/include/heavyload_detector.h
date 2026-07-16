@@ -23,6 +23,13 @@ typedef struct {
 /* Opaque heavy load detector handle */
 typedef struct HeavyLoadDetector HeavyLoadDetector;
 
+/* Parse one per-CPU /proc/stat line. Returns false for aggregate or malformed
+ * lines. These helpers also make the sampling math independently testable. */
+bool heavyload_parse_cpu_stat_line(const char *line, int *cpu_id,
+                                   CpuStat *stat);
+float heavyload_calculate_cpu_load(const CpuStat *previous,
+                                   const CpuStat *current);
+
 /* Create a new heavy load detector.
  * sample_time_ms: sampling interval in milliseconds.
  * heavy_load_threshold: load score above which we consider it "heavy".
@@ -47,8 +54,8 @@ bool heavyload_detector_is_heavy(const HeavyLoadDetector *d);
 /* Get the smoothed load average. */
 float heavyload_detector_get_avg_load(const HeavyLoadDetector *d);
 
-/* Get raw per-CPU load percentages (caller must free).
- * Returns pointer to array of nr_cpus floats. */
+/* Get the most recent per-CPU load percentages. Caller must free the returned
+ * snapshot. Returns NULL when no CPU data is available. */
 float *heavyload_detector_get_cpu_loads(const HeavyLoadDetector *d, int *nr_cpus);
 
 #endif /* UPERF_HEAVYLOAD_DETECTOR_H */

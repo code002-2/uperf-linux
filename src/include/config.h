@@ -6,6 +6,12 @@
 #include "power_model.h"
 
 #define MAX_CLUSTERS     4
+#define MAX_CPUS         64
+#define MAX_CPU_MASK_GROUPS 8
+#define MAX_AFFINITY_PROFILES 16
+#define MAX_PRIORITY_PROFILES 16
+#define MAX_THREAD_RULES 16
+#define MAX_CGROUP_CLASSES 8
 #define MAX_KNOBS        64
 #define MAX_RULES        32
 #define MAX_POWER_MODES  8
@@ -42,8 +48,26 @@ typedef enum {
     MODE_NUM
 } PowerMode;
 
+/* Presence bits for scalar tuning values in a preset.  A separate mask is
+ * required because zero and false are valid explicit overrides. */
+typedef enum {
+    ACTION_TUNE_LATENCY_TIME             = 1u << 0,
+    ACTION_TUNE_SLOW_LIMIT_POWER         = 1u << 1,
+    ACTION_TUNE_FAST_LIMIT_POWER         = 1u << 2,
+    ACTION_TUNE_FAST_LIMIT_CAPACITY      = 1u << 3,
+    ACTION_TUNE_FAST_LIMIT_RECOVER_SCALE = 1u << 4,
+    ACTION_TUNE_MARGIN                   = 1u << 5,
+    ACTION_TUNE_BURST                    = 1u << 6,
+    ACTION_TUNE_GUIDE_CAP                = 1u << 7,
+    ACTION_TUNE_LIMIT_EFFICIENCY         = 1u << 8,
+    ACTION_TUNE_BASE_SAMPLE_TIME         = 1u << 9,
+    ACTION_TUNE_BASE_SLACK_TIME          = 1u << 10,
+    ACTION_TUNE_PREDICT_THD              = 1u << 11,
+} ActionTuningField;
+
 /* CPU frequency / uClamp limits for an action */
 typedef struct {
+    uint32_t     tuning_present;
     bool         has_cpu_freq_max;
     int          cpu_freq_max[MAX_CLUSTERS];  /* Hz */
     bool         has_cpu_freq_min;
@@ -128,50 +152,90 @@ typedef struct {
     int     screen_height;  /* Physical screen height in pixels (0 = auto-detect) */
 } InputConfig;
 
-/* Scheduling affinity class name */
+/* Scheduling context used by the original Uperf affinity/priority profiles. */
 typedef enum {
-    AC_AUTO = 0,
-    AC_BG,
-    AC_NORM,
-    AC_COOP,
-    AC_UI,
-    AC_RTUSR,
-    AC_NUM_CLASSES
-} AffinityClass;
-
-/* Per-rule scheduling priority profile */
-typedef struct {
-    int bg;
-    int fg;
-    int idle;
-    int touch;
-    int boost;
-} SchedPrioProfile;
+    SCHED_CTX_BG = 0,
+    SCHED_CTX_FG,
+    SCHED_CTX_IDLE,
+    SCHED_CTX_TOUCH,
+    SCHED_CTX_BOOST,
+    SCHED_CTX_NUM
+} SchedContext;
 
 /* CPU mask group */
 typedef struct {
     char    name[MAX_NAME_LEN];
-    int     cpus[MAX_CLUSTERS * 4];  /* flat list of CPU indices */
+    int     cpus[MAX_CPUS];
     int     nr_cpus;
+    uint64_t mask;
 } CpuMaskGroup;
 
-/* A single sched rule: regex + affinity class + priority profile */
+/* A named affinity profile maps each scheduling context to a CPU mask.
+ * has_mask=false means that the scheduler must leave/restore affinity. */
 typedef struct {
-    char   name[MAX_NAME_LEN];
-    char   regex[MAX_PATH_LEN];
-    bool   pinned;
-    AffinityClass affinity_class;
-    SchedPrioProfile prio_profile;
+    char name[MAX_NAME_LEN];
+    uint64_t masks[SCHED_CTX_NUM];
+    bool has_mask[SCHED_CTX_NUM];
+} AffinityProfile;
+
+/* Priority encoding is compatible with Uperf:
+ *   0       leave unchanged
+ *  -1/-2/-3 SCHED_OTHER/BATCH/IDLE
+ *   1..98   SCHED_FIFO priority
+ *   100..139 SCHED_OTHER with nice=(value-120) */
+typedef struct {
+    char name[MAX_NAME_LEN];
+    int values[SCHED_CTX_NUM];
+} PriorityProfile;
+
+/* A process rule contains ordered, first-match thread rules. */
+typedef struct {
+    char regex[MAX_PATH_LEN];
+    char affinity_name[MAX_NAME_LEN];
+    char priority_name[MAX_NAME_LEN];
+    int affinity_index;
+    int priority_index;
+} SchedThreadRule;
+
+typedef struct {
+    char name[MAX_NAME_LEN];
+    char regex[MAX_PATH_LEN];
+    bool pinned;
+    bool match_game;
+    char cgroup_class[MAX_NAME_LEN];
+    SchedThreadRule thread_rules[MAX_THREAD_RULES];
+    int nr_thread_rules;
 } SchedRule;
 
 /* Sched module configuration */
 typedef struct {
     bool enable;
-    CpuMaskGroup cpumasks[MAX_CLUSTERS];
+    CpuMaskGroup cpumasks[MAX_CPU_MASK_GROUPS];
     int nr_cpumasks;
+    AffinityProfile affinity_profiles[MAX_AFFINITY_PROFILES];
+    int nr_affinity_profiles;
+    PriorityProfile priority_profiles[MAX_PRIORITY_PROFILES];
+    int nr_priority_profiles;
     SchedRule rules[MAX_RULES];
     int nr_rules;
 } SchedConfig;
+
+/* Process-group resource class. cpu_mask=0 leaves AllowedCPUs unchanged. */
+typedef struct {
+    char name[MAX_NAME_LEN];
+    char cpumask_name[MAX_NAME_LEN];
+    uint64_t cpu_mask;
+    int cpu_weight;
+    int uclamp_min;
+    int uclamp_max;
+} CgroupClass;
+
+typedef struct {
+    bool enable;
+    char backend[MAX_NAME_LEN];
+    CgroupClass classes[MAX_CGROUP_CLASSES];
+    int nr_classes;
+} CgroupConfig;
 
 /* CPU module configuration */
 typedef struct {
@@ -187,6 +251,15 @@ typedef struct {
     int nr_knobs;
 } SysfsConfig;
 
+/* Thermal thresholds configured under modules.thermal. */
+typedef struct {
+    bool enable;
+    int warn_temp;
+    int throttle_temp;
+    int critical_temp;
+    int recovery_temp;
+} ThermalConfig;
+
 /* Full config — the union of all module configs + presets */
 typedef struct {
     char meta_name[MAX_NAME_LEN];
@@ -197,6 +270,8 @@ typedef struct {
     CpuConfig       cpu;
     SysfsConfig     sysfs;
     SchedConfig     sched;
+    CgroupConfig    cgroup;
+    ThermalConfig   thermal;
 
     PowerModePreset presets[MODE_NUM];
 

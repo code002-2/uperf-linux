@@ -2,18 +2,16 @@
 set -e
 
 case "$1" in
-    purge)
-        # Stop and disable the service
+    remove)
         systemctl stop uperf-linux.service 2>/dev/null || true
         systemctl disable uperf-linux.service 2>/dev/null || true
 
-        # Remove runtime directory
         rm -rf /run/uperf-linux
 
         echo "uperf-linux removed."
         ;;
 
-    remove|upgrade|abootstrap)
+    upgrade|deconfigure|failed-upgrade)
         ;;
 
     *)

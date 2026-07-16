@@ -16,7 +16,7 @@
 #include <syslog.h>
 
 /* Internal state */
-static LogLevel g_level       = LOG_INFO;
+static LogLevel g_level       = UPERF_LOG_INFO;
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static FILE  *g_log_fp        = NULL;
 static int    g_use_journald  = 0;
@@ -29,24 +29,28 @@ static void format_timestamp(char *buf, size_t len) {
     localtime_r(&ts.tv_sec, &tm);
     strftime(buf, len, "%Y-%m-%d %H:%M:%S", &tm);
     char tmp[8];
-    snprintf(tmp, sizeof(tmp), ".%03ld", ts.tv_nsec / 1000000L);
+    unsigned int millis = (unsigned int)(ts.tv_nsec / 1000000L);
+    snprintf(tmp, sizeof(tmp), ".%03u", millis);
     strncat(buf, tmp, len - strlen(buf) - 1);
 }
 
-/* Map LogLevel to syslog priority (hardcoded values avoids syslog.h enum conflict) */
+/* Map the project-specific levels to syslog priorities. */
 static int syslog_priority(LogLevel level) {
     switch (level) {
-        case LOG_DEBUG:  return 7;
-        case LOG_INFO:   return 6;
-        case LOG_WARN:   return 4;
-        case LOG_ERROR:  return 3;
-        case LOG_FATAL:  return 2;
+        case UPERF_LOG_DEBUG:  return LOG_DEBUG;
+        case UPERF_LOG_INFO:   return LOG_INFO;
+        case UPERF_LOG_WARN:   return LOG_WARNING;
+        case UPERF_LOG_ERROR:  return LOG_ERR;
+        case UPERF_LOG_FATAL:  return LOG_CRIT;
         default:         return 6;
     }
 }
 
 void log_impl(LogLevel level, const char *file, int line, const char *func,
               const char *fmt, ...) {
+    if (level < UPERF_LOG_DEBUG || level >= UPERF_LOG_NUM_LEVELS)
+        return;
+
     if (level < g_level)
         return;
 
@@ -56,19 +60,16 @@ void log_impl(LogLevel level, const char *file, int line, const char *func,
     format_timestamp(ts, sizeof(ts));
 
     /* Build formatted message */
-    va_list ap, ap_copy;
+    va_list ap;
     va_start(ap, fmt);
-    va_copy(ap_copy, ap);
     char msg_buf[1024];
     int len = vsnprintf(msg_buf, sizeof(msg_buf), fmt, ap);
     va_end(ap);
     if (len < 0) {
-        va_end(ap_copy);
         pthread_mutex_unlock(&g_mutex);
         return;
     }
     msg_buf[sizeof(msg_buf) - 1] = '\0';
-    va_end(ap_copy);
 
     /* Prefix: [timestamp] [LEVEL] file:line func: message */
     const char *level_str[] = {"DEBUG", "INFO ", "WARN ", "ERROR", "FATAL"};
@@ -101,7 +102,7 @@ void log_impl(LogLevel level, const char *file, int line, const char *func,
 #endif
 
     /* FATAL: flush and return (caller should call exit()/abort()) */
-    if (level == LOG_FATAL) {
+    if (level == UPERF_LOG_FATAL) {
         if (g_log_fp)
             fflush(g_log_fp);
         pthread_mutex_unlock(&g_mutex);
@@ -112,6 +113,9 @@ void log_impl(LogLevel level, const char *file, int line, const char *func,
 }
 
 int log_init(LogLevel level, int use_journald, const char *log_file) {
+    if (level < UPERF_LOG_DEBUG || level >= UPERF_LOG_NUM_LEVELS)
+        level = UPERF_LOG_INFO;
+
     g_level = level;
     g_use_journald = use_journald;
 
@@ -144,6 +148,7 @@ LogLevel log_get_level(void) {
 }
 
 void log_shutdown(void) {
+    log_debug("Logging shutdown");
     pthread_mutex_lock(&g_mutex);
     if (g_log_fp) {
         fclose(g_log_fp);
@@ -151,5 +156,4 @@ void log_shutdown(void) {
     }
     pthread_mutex_unlock(&g_mutex);
     pthread_mutex_destroy(&g_mutex);
-    log_debug("Logging shutdown");
 }

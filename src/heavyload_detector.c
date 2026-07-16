@@ -1,4 +1,4 @@
-#define _GNU_SOURCE
+#define _POSIX_C_SOURCE 200809L
 #include "heavyload_detector.h"
 #include "log.h"
 
@@ -7,6 +7,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <inttypes.h>
+#include <ctype.h>
 
 /* Internal heavy load detector state */
 struct HeavyLoadDetector {
@@ -18,13 +20,9 @@ struct HeavyLoadDetector {
     /* Per-CPU stats */
     CpuStat *prev_stats;
     CpuStat *curr_stats;
+    float   *cpu_loads;
     int nr_cpus;
-
-    /* Per-CPU smoothed loads */
-    float  *per_cpu_smoothed_loads;
-    int     per_cpu_hist_idx[64];
-    float   per_cpu_hist[64][LOAD_HISTORY_SIZE];
-    int     per_cpu_hist_count[64];
+    bool have_previous_sample;
 
     /* Load history for smoothing */
     float load_history[LOAD_HISTORY_SIZE];
@@ -37,26 +35,55 @@ struct HeavyLoadDetector {
     float smoothed_load;
     uint64_t last_sample_ms;
     uint64_t last_heavy_end_ms;
+    uint64_t below_idle_since_ms;
 };
 
-/* Read /proc/stat for a single CPU (or aggregate) */
-static int read_cpu_stat(CpuStat *stat) {
-    FILE *fp = fopen("/proc/stat", "r");
-    if (!fp) return -1;
+bool heavyload_parse_cpu_stat_line(const char *line, int *cpu_id,
+                                   CpuStat *stat) {
+    if (!line || !cpu_id || !stat || strncmp(line, "cpu", 3) != 0 ||
+        !isdigit((unsigned char)line[3]))
+        return false;
 
-    char line[1024];
-    if (!fgets(line, sizeof(line), fp)) {
-        fclose(fp);
-        return -1;
-    }
-    fclose(fp);
+    CpuStat parsed_stat = {0};
+    int parsed_cpu = -1;
+    int parsed = sscanf(line,
+                        "cpu%d %" SCNu64 " %" SCNu64 " %" SCNu64
+                        " %" SCNu64 " %" SCNu64 " %" SCNu64
+                        " %" SCNu64 " %" SCNu64,
+                        &parsed_cpu, &parsed_stat.user, &parsed_stat.nice,
+                        &parsed_stat.system, &parsed_stat.idle,
+                        &parsed_stat.iowait, &parsed_stat.irq,
+                        &parsed_stat.softirq, &parsed_stat.steal);
+    if (parsed < 8 || parsed_cpu < 0)
+        return false;
 
-    /* Parse: cpu  user nice system idle iowait irq softirq steal */
-    int parsed = sscanf(line, "cpu %lu %lu %lu %lu %lu %lu %lu %lu",
-                        &stat->user, &stat->nice, &stat->system,
-                        &stat->idle, &stat->iowait, &stat->irq,
-                        &stat->softirq, &stat->steal);
-    return (parsed >= 7) ? 0 : -1;
+    *cpu_id = parsed_cpu;
+    *stat = parsed_stat;
+    return true;
+}
+
+float heavyload_calculate_cpu_load(const CpuStat *previous,
+                                   const CpuStat *current) {
+    if (!previous || !current) return 0.0f;
+
+    uint64_t previous_total = previous->user + previous->nice +
+        previous->system + previous->idle + previous->iowait +
+        previous->irq + previous->softirq + previous->steal;
+    uint64_t current_total = current->user + current->nice +
+        current->system + current->idle + current->iowait +
+        current->irq + current->softirq + current->steal;
+    if (current_total <= previous_total)
+        return 0.0f;
+
+    uint64_t delta_total = current_total - previous_total;
+    uint64_t previous_idle = previous->idle + previous->iowait;
+    uint64_t current_idle = current->idle + current->iowait;
+    uint64_t delta_idle = current_idle >= previous_idle
+        ? current_idle - previous_idle : 0;
+    if (delta_idle > delta_total)
+        delta_idle = delta_total;
+
+    return (float)(delta_total - delta_idle) / (float)delta_total * 100.0f;
 }
 
 /* Read per-CPU stats from /proc/stat */
@@ -67,15 +94,11 @@ static int read_per_cpu_stats(CpuStat *stats, int nr_cpus) {
     char line[256];
     int cpu_idx = 0;
     while (fgets(line, sizeof(line), fp) && cpu_idx < nr_cpus) {
-        /* Match lines like "cpu0 1234 567 ..." */
-        if (line[0] == 'c' && line[1] == 'p' && line[2] >= '0' && line[2] <= '9') {
-            CpuStat *stat = &stats[cpu_idx];
-            int parsed = sscanf(line, "cpu%*d %lu %lu %lu %lu %lu %lu %lu %lu",
-                                &stat->user, &stat->nice, &stat->system,
-                                &stat->idle, &stat->iowait, &stat->irq,
-                                &stat->softirq, &stat->steal);
-            if (parsed < 7)
-                memset(stat, 0, sizeof(*stat));
+        int cpu_id;
+        CpuStat stat;
+        if (heavyload_parse_cpu_stat_line(line, &cpu_id, &stat)) {
+            (void)cpu_id;
+            stats[cpu_idx] = stat;
             cpu_idx++;
         }
     }
@@ -89,6 +112,35 @@ static int get_nr_cpus(void) {
     return (n > 0) ? (int)n : 1;
 }
 
+static uint64_t monotonic_time_ms(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 0;
+    return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+}
+
+static bool resize_cpu_arrays(HeavyLoadDetector *d, int nr_cpus) {
+    CpuStat *previous = calloc((size_t)nr_cpus, sizeof(*previous));
+    CpuStat *current = calloc((size_t)nr_cpus, sizeof(*current));
+    float *loads = calloc((size_t)nr_cpus, sizeof(*loads));
+    if (!previous || !current || !loads) {
+        free(previous);
+        free(current);
+        free(loads);
+        return false;
+    }
+
+    free(d->prev_stats);
+    free(d->curr_stats);
+    free(d->cpu_loads);
+    d->prev_stats = previous;
+    d->curr_stats = current;
+    d->cpu_loads = loads;
+    d->nr_cpus = nr_cpus;
+    d->have_previous_sample = false;
+    return true;
+}
+
 HeavyLoadDetector *heavyload_detector_new(float sample_time_ms,
                                           float heavy_load_threshold,
                                           float idle_load_threshold,
@@ -100,27 +152,10 @@ HeavyLoadDetector *heavyload_detector_new(float sample_time_ms,
     d->heavy_load_threshold = heavy_load_threshold;
     d->idle_load_threshold = idle_load_threshold;
     d->request_burst_slack_ms = request_burst_slack_ms;
-    d->nr_cpus = get_nr_cpus();
-
-    d->prev_stats = calloc(d->nr_cpus, sizeof(CpuStat));
-    d->curr_stats = calloc(d->nr_cpus, sizeof(CpuStat));
-    if (!d->prev_stats || !d->curr_stats) {
-        free(d->prev_stats);
-        free(d->curr_stats);
+    if (!resize_cpu_arrays(d, get_nr_cpus())) {
         free(d);
         return NULL;
     }
-
-    d->per_cpu_smoothed_loads = calloc(d->nr_cpus, sizeof(float));
-    if (!d->per_cpu_smoothed_loads) {
-        free(d->prev_stats);
-        free(d->curr_stats);
-        free(d);
-        return NULL;
-    }
-    memset(d->per_cpu_hist_idx, 0, sizeof(d->per_cpu_hist_idx));
-    memset(d->per_cpu_hist, 0, sizeof(d->per_cpu_hist));
-    memset(d->per_cpu_hist_count, 0, sizeof(d->per_cpu_hist_count));
 
     d->heavy_load_active = false;
     d->current_load = 0.0f;
@@ -138,13 +173,20 @@ void heavyload_detector_free(HeavyLoadDetector *d) {
     if (!d) return;
     free(d->prev_stats);
     free(d->curr_stats);
-    free(d->per_cpu_smoothed_loads);
+    free(d->cpu_loads);
     log_debug("HeavyLoadDetector destroyed");
     free(d);
 }
 
 float heavyload_detector_sample(HeavyLoadDetector *d) {
     if (!d) return 0.0f;
+
+    int online_cpus = get_nr_cpus();
+    if (online_cpus != d->nr_cpus && !resize_cpu_arrays(d, online_cpus)) {
+        log_error("heavyload_detector: failed to resize CPU arrays to %d",
+                  online_cpus);
+        return d->current_load;
+    }
 
     /* Read current CPU stats */
     int nr = read_per_cpu_stats(d->curr_stats, d->nr_cpus);
@@ -154,56 +196,26 @@ float heavyload_detector_sample(HeavyLoadDetector *d) {
     }
 
     if (nr != d->nr_cpus) {
-        /* CPU topology changed — reinitialize */
-        free(d->prev_stats);
-        free(d->curr_stats);
-        free(d->per_cpu_smoothed_loads);
-        d->nr_cpus = nr;
-        d->prev_stats = calloc(nr, sizeof(CpuStat));
-        d->curr_stats = calloc(nr, sizeof(CpuStat));
-        d->per_cpu_smoothed_loads = calloc(nr, sizeof(float));
-        if (!d->prev_stats || !d->curr_stats || !d->per_cpu_smoothed_loads)
-            return 0.0f;
-        memset(d->per_cpu_hist_idx, 0, sizeof(d->per_cpu_hist_idx));
-        memset(d->per_cpu_hist, 0, sizeof(d->per_cpu_hist));
-        memset(d->per_cpu_hist_count, 0, sizeof(d->per_cpu_hist_count));
+        log_warn("heavyload_detector: expected %d CPU rows, read %d",
+                 d->nr_cpus, nr);
+        return d->current_load;
+    }
+
+    if (!d->have_previous_sample) {
+        memcpy(d->prev_stats, d->curr_stats,
+               (size_t)nr * sizeof(*d->prev_stats));
+        memset(d->cpu_loads, 0, (size_t)nr * sizeof(*d->cpu_loads));
+        d->have_previous_sample = true;
+        d->last_sample_ms = monotonic_time_ms();
+        return 0.0f;
     }
 
     /* Calculate delta for each CPU */
     float total_load = 0.0f;
     for (int i = 0; i < nr; i++) {
-        uint64_t prev_total = d->prev_stats[i].user + d->prev_stats[i].nice +
-                              d->prev_stats[i].system + d->prev_stats[i].idle +
-                              d->prev_stats[i].iowait + d->prev_stats[i].irq +
-                              d->prev_stats[i].softirq + d->prev_stats[i].steal;
-        uint64_t curr_total = d->curr_stats[i].user + d->curr_stats[i].nice +
-                              d->curr_stats[i].system + d->curr_stats[i].idle +
-                              d->curr_stats[i].iowait + d->curr_stats[i].irq +
-                              d->curr_stats[i].softirq + d->curr_stats[i].steal;
-
-        uint64_t delta = curr_total - prev_total;
-        if (delta == 0) {
-            d->prev_stats[i] = d->curr_stats[i];
-            continue;
-        }
-
-        uint64_t busy = delta - (d->curr_stats[i].idle + d->curr_stats[i].iowait);
-        float load_pct = (float)busy / (float)delta * 100.0f;
-        total_load += load_pct;
-
-        /* Per-CPU EMA smoothing */
-        if (d->per_cpu_hist_count[i] == 0) {
-            d->per_cpu_smoothed_loads[i] = load_pct;
-        } else {
-            d->per_cpu_smoothed_loads[i] =
-                d->per_cpu_smoothed_loads[i] * 0.7f + load_pct * 0.3f;
-        }
-
-        /* Update per-CPU history ring buffer */
-        d->per_cpu_hist[i][d->per_cpu_hist_idx[i]] = d->per_cpu_smoothed_loads[i];
-        d->per_cpu_hist_idx[i] = (d->per_cpu_hist_idx[i] + 1) % LOAD_HISTORY_SIZE;
-        if (d->per_cpu_hist_count[i] < LOAD_HISTORY_SIZE)
-            d->per_cpu_hist_count[i]++;
+        d->cpu_loads[i] = heavyload_calculate_cpu_load(
+            &d->prev_stats[i], &d->curr_stats[i]);
+        total_load += d->cpu_loads[i];
 
         /* Store for next iteration */
         d->prev_stats[i] = d->curr_stats[i];
@@ -226,25 +238,29 @@ float heavyload_detector_sample(HeavyLoadDetector *d) {
         d->load_hist_count++;
 
     /* Check heavy load state transitions */
-    struct timespec now_ts;
-    clock_gettime(CLOCK_MONOTONIC, &now_ts);
-    uint64_t now_ms = (uint64_t)now_ts.tv_sec * 1000ULL +
-                       now_ts.tv_nsec / 1000000ULL;
+    uint64_t now_ms = monotonic_time_ms();
+    d->last_sample_ms = now_ms;
 
-    if (!d->heavy_load_active && d->smoothed_load > d->heavy_load_threshold) {
+    if (!d->heavy_load_active && d->smoothed_load > d->heavy_load_threshold &&
+        (d->last_heavy_end_ms == 0 ||
+         now_ms - d->last_heavy_end_ms >= (uint64_t)d->request_burst_slack_ms)) {
         d->heavy_load_active = true;
+        d->below_idle_since_ms = 0;
         log_info("HeavyLoad START: load=%.1f%% (threshold=%.1f%%)",
                  d->smoothed_load, d->heavy_load_threshold);
     } else if (d->heavy_load_active && d->smoothed_load < d->idle_load_threshold) {
         /* Must stay below idle threshold for a grace period */
-        if (now_ms - d->last_heavy_end_ms > 1000) {  /* 1 second grace */
+        if (d->below_idle_since_ms == 0)
+            d->below_idle_since_ms = now_ms;
+        if (now_ms - d->below_idle_since_ms >= 1000) {
             d->heavy_load_active = false;
             d->last_heavy_end_ms = now_ms;
+            d->below_idle_since_ms = 0;
             log_info("HeavyLoad END: load=%.1f%% (threshold=%.1f%%)",
                      d->smoothed_load, d->idle_load_threshold);
         }
     } else if (d->heavy_load_active) {
-        d->last_heavy_end_ms = now_ms;
+        d->below_idle_since_ms = 0;
     }
 
     return d->smoothed_load;
@@ -261,8 +277,11 @@ float heavyload_detector_get_avg_load(const HeavyLoadDetector *d) {
 }
 
 float *heavyload_detector_get_cpu_loads(const HeavyLoadDetector *d, int *nr_cpus) {
-    if (!d || !nr_cpus) return NULL;
+    if (!d || !nr_cpus || d->nr_cpus <= 0) return NULL;
 
+    float *snapshot = malloc((size_t)d->nr_cpus * sizeof(*snapshot));
+    if (!snapshot) return NULL;
     *nr_cpus = d->nr_cpus;
-    return d->per_cpu_smoothed_loads;
+    memcpy(snapshot, d->cpu_loads, (size_t)d->nr_cpus * sizeof(*snapshot));
+    return snapshot;
 }

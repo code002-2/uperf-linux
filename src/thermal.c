@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 
 #ifndef MAX_PATH_LEN
 #define MAX_PATH_LEN 256
@@ -24,6 +25,8 @@ struct ThermalManager {
     ThermalZone zones[THERMAL_MAX_ZONES];
     int nr_zones;
     ThermalState current_state;
+    ThermalState pending_state;
+    int64_t pending_since_ms;
     int max_temp;
 };
 
@@ -49,10 +52,10 @@ static int read_line(const char *path, char *buf, size_t len) {
 static ThermalZoneType classify_zone(const char *type) {
     if (!type) return THERMAL_ZONE_UNKNOWN;
 
-    if (strstr(type, "cpu") || strstr(type, "thermal"))
-        return THERMAL_ZONE_CPU;
     if (strstr(type, "gpu"))
         return THERMAL_ZONE_GPU;
+    if (strstr(type, "cpu"))
+        return THERMAL_ZONE_CPU;
     if (strstr(type, "soc") || strstr(type, "chip"))
         return THERMAL_ZONE_SOC;
     if (strstr(type, "battery") || strstr(type, "batt"))
@@ -75,6 +78,8 @@ ThermalManager *thermal_manager_new(const ThermalPolicy *policy) {
 
     tm->nr_zones = 0;
     tm->current_state = THERMAL_NORMAL;
+    tm->pending_state = THERMAL_NORMAL;
+    tm->pending_since_ms = -1;
     tm->max_temp = 0;
 
     log_info("ThermalManager created: warn=%d throttle=%d critical=%d recovery=%d",
@@ -145,8 +150,8 @@ int thermal_manager_discover_zones(ThermalManager *tm) {
         /* Store zone info */
         ThermalZone *zone = &tm->zones[tm->nr_zones];
         zone->id = (int)zone_num;
-        strncpy(zone->name, name_str, THERMAL_NAME_LEN - 1);
-        strncpy(zone->type, type_str, THERMAL_NAME_LEN - 1);
+        snprintf(zone->name, sizeof(zone->name), "%s", name_str);
+        snprintf(zone->type, sizeof(zone->type), "%s", type_str);
         zone->temp_millidegC = temp_milli;
         zone->zone_type = classify_zone(type_str);
         zone->valid = true;
@@ -167,8 +172,6 @@ ThermalState thermal_manager_update(ThermalManager *tm) {
     if (!tm || tm->nr_zones == 0) return THERMAL_NORMAL;
 
     tm->max_temp = 0;
-    ThermalState state = THERMAL_NORMAL;
-
     for (int i = 0; i < tm->nr_zones; i++) {
         ThermalZone *zone = &tm->zones[i];
 
@@ -184,17 +187,17 @@ ThermalState thermal_manager_update(ThermalManager *tm) {
         if (zone->temp_millidegC > tm->max_temp)
             tm->max_temp = zone->temp_millidegC;
 
-        /* Check thresholds */
-        if (zone->temp_millidegC >= tm->policy.critical_temp) {
-            state = THERMAL_CRITICAL;
-        } else if (zone->temp_millidegC >= tm->policy.throttle_temp) {
-            if (state < THERMAL_THROTTLED)
-                state = THERMAL_THROTTLED;
-        } else if (zone->temp_millidegC >= tm->policy.warn_temp) {
-            if (state < THERMAL_WARNING)
-                state = THERMAL_WARNING;
-        }
     }
+
+    ThermalState proposed = thermal_policy_next_state(
+        &tm->policy, tm->current_state, tm->max_temp);
+    struct timespec now;
+    int64_t now_ms = 0;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+        now_ms = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+    ThermalState state = thermal_debounce_transition(
+        tm->current_state, proposed, &tm->pending_state,
+        &tm->pending_since_ms, now_ms);
 
     /* Log state changes */
     if (state != tm->current_state) {
@@ -206,6 +209,80 @@ ThermalState thermal_manager_update(ThermalManager *tm) {
 
     tm->current_state = state;
     return state;
+}
+
+ThermalState thermal_policy_next_state(const ThermalPolicy *policy,
+                                       ThermalState current,
+                                       int max_temp) {
+    if (!policy) return THERMAL_NORMAL;
+    ThermalState measured = THERMAL_NORMAL;
+    if (max_temp >= policy->critical_temp)
+        measured = THERMAL_CRITICAL;
+    else if (max_temp >= policy->throttle_temp)
+        measured = THERMAL_THROTTLED;
+    else if (max_temp >= policy->warn_temp)
+        measured = THERMAL_WARNING;
+
+    if (measured >= current) return measured;
+
+    /* Retain each state until temperature has fallen far enough below its
+     * entry threshold. recovery_temp is the configured throttle exit point;
+     * warning uses a small fixed deadband. */
+    if (current == THERMAL_CRITICAL &&
+        max_temp >= policy->critical_temp - 3000)
+        return THERMAL_CRITICAL;
+    if (current >= THERMAL_THROTTLED && measured < THERMAL_THROTTLED &&
+        max_temp >= policy->recovery_temp)
+        return THERMAL_THROTTLED;
+    if (current >= THERMAL_WARNING && measured == THERMAL_NORMAL &&
+        max_temp >= policy->warn_temp - 3000)
+        return THERMAL_WARNING;
+    return measured;
+}
+
+ThermalState thermal_debounce_transition(ThermalState current,
+                                         ThermalState proposed,
+                                         ThermalState *pending,
+                                         int64_t *pending_since_ms,
+                                         int64_t now_ms) {
+    if (!pending || !pending_since_ms || proposed < THERMAL_NORMAL ||
+        proposed >= THERMAL_NUM_STATES)
+        return current;
+
+    if (proposed == current) {
+        *pending = current;
+        *pending_since_ms = -1;
+        return current;
+    }
+
+    /* Never delay the emergency state. */
+    if (proposed == THERMAL_CRITICAL) {
+        *pending = proposed;
+        *pending_since_ms = -1;
+        return proposed;
+    }
+
+    if (*pending != proposed || *pending_since_ms < 0 ||
+        now_ms < *pending_since_ms) {
+        *pending = proposed;
+        *pending_since_ms = now_ms;
+        return current;
+    }
+
+    int64_t dwell_ms;
+    if (proposed < current)
+        dwell_ms = 2000; /* Recover only after a stable cool period. */
+    else if (proposed >= THERMAL_THROTTLED)
+        dwell_ms = 500;
+    else
+        dwell_ms = 1000;
+
+    if (now_ms - *pending_since_ms < dwell_ms)
+        return current;
+
+    *pending = proposed;
+    *pending_since_ms = -1;
+    return proposed;
 }
 
 int thermal_manager_zone_count(const ThermalManager *tm) {

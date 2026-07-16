@@ -1,587 +1,643 @@
 #include <gtk/gtk.h>
-#include <libadwaita-1/adwaita.h>
+#include <adwaita.h>
 #include "dbus_proxy.h"
 
 /* ----------------------------------------------------------------
- * App state
+ * uperf-linux GUI — rebuilt around libadwaita idioms.
+ *
+ * Navigation:  AdwViewStack + AdwViewSwitcher (responsive, with a
+ *              selected-state that the old hand-rolled tab bar lacked).
+ * Content:     each page groups related data into AdwPreferencesGroup
+ *              cards; live values live in AdwActionRow suffixes so the
+ *              layout stays stable as numbers change.
+ *
+ * The DbusProxy backend contract is unchanged (see dbus_proxy.h). All
+ * daemon frequencies are reported in MHz; the manual-override API takes
+ * CPU values in Hz and GPU in Hz.
  * ---------------------------------------------------------------- */
+
+#define UPERF_MAX_CLUSTERS 8
+#define UPERF_MAX_CPUS     8
+
+/* Cluster labels used by the dashboard + override page. The daemon
+ * publishes clusters ordered prime → performance → efficiency. */
+static const char *const CLUSTER_NAMES[] = { "Prime", "Performance", "Efficiency" };
 
 typedef struct {
     DbusProxy *proxy;
-    GtkListBox *game_list;
+
+    /* Dashboard live rows */
+    GtkWidget  *row_mode;
+    GtkWidget  *row_scene;
+    GtkWidget  *row_heavy;
+    GtkWidget  *row_temp;
+    GtkWidget  *row_thermal;
+    GtkWidget  *temp_bar;
+    GtkWidget  *freq_rows[UPERF_MAX_CLUSTERS];
+    GtkWidget  *load_rows[UPERF_MAX_CPUS];
+
+    /* Scheduler card */
+    GtkWidget  *row_active_pid;
+    GtkWidget  *row_tracked;
+
+    /* Mode selector buttons (linked group) */
+    GtkWidget  *mode_buttons[4];
+
+    /* Games */
+    GtkWidget  *games_group;
+    GtkWidget  *games_placeholder;
+    GtkWidget **game_rows;
+    int         game_rows_len;
+
+    /* Logs */
     GtkTextView *log_view;
-    GtkLabel *lbl_mode;
-    GtkLabel *lbl_scene;
-    GtkLabel *lbl_heavy;
-    GtkLabel *lbl_max_temp;
-    GtkLabel *lbl_thermal;
-    GtkProgressBar *load_bar;
-    GtkProgressBar *temp_bar;
-    GtkWidget **freq_labels;
-    GtkWidget **load_labels;
-    GtkStack *stack;
+
+    /* Frequency override */
+    GtkWidget    *freq_toggle;
+    GtkAdjustment *freq_adj[4];
+    GtkWidget    *freq_scale_rows[4];
+
+    /* Toasts */
+    AdwToastOverlay *toasts;
 } AppState;
 
 static AppState g_app;
 
+static void refresh_games(void);
+
+/* ---------------------------------------------------------------- */
+
+static void toast(const char *text) {
+    if (g_app.toasts)
+        adw_toast_overlay_add_toast(g_app.toasts, adw_toast_new(text));
+}
+
+static const char *mode_display_name(const char *mode) {
+    if (!mode) return "Unknown";
+    if (!g_strcmp0(mode, "balance"))     return "Balance";
+    if (!g_strcmp0(mode, "powersave"))   return "Power Save";
+    if (!g_strcmp0(mode, "performance")) return "Performance";
+    if (!g_strcmp0(mode, "fast"))        return "Fast";
+    return mode;
+}
+
 /* ----------------------------------------------------------------
- * Helpers
+ * Live refresh: pull cached proxy state into the widgets.
  * ---------------------------------------------------------------- */
 
 static void refresh_display(void) {
     if (!g_app.proxy) return;
+    DbusProxy *p = g_app.proxy;
 
-    if (g_app.lbl_mode)
-        gtk_label_set_text(g_app.lbl_mode, g_app.proxy->current_mode);
-    if (g_app.lbl_scene)
-        gtk_label_set_text(g_app.lbl_scene, g_app.proxy->current_scene);
-    if (g_app.lbl_heavy)
-        gtk_label_set_text(g_app.lbl_heavy,
-            g_app.proxy->is_heavy_load ? "HEAVY LOAD ACTIVE" : "Normal Load");
-    if (g_app.load_bar)
-        gtk_progress_bar_set_fraction(g_app.load_bar,
-            g_app.proxy->is_heavy_load ? 0.9 : 0.3);
-    if (g_app.lbl_max_temp) {
-        double temp_c = g_app.proxy->max_temp / 1000.0;
-        gchar buf[64];
-        g_snprintf(buf, sizeof(buf), "%.1f C", temp_c);
-        gtk_label_set_text(g_app.lbl_max_temp, buf);
+    if (g_app.row_mode)
+        adw_action_row_set_subtitle(ADW_ACTION_ROW(g_app.row_mode),
+                                    mode_display_name(p->current_mode));
+
+    /* Keep the mode selector in sync with the daemon's actual mode. */
+    static const char *modes[] = { "balance", "powersave", "performance", "fast" };
+    for (int i = 0; i < 4; i++) {
+        if (!g_app.mode_buttons[i]) continue;
+        gboolean active = !g_strcmp0(p->current_mode, modes[i]);
+        if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(g_app.mode_buttons[i])) != active)
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g_app.mode_buttons[i]), active);
     }
-    if (g_app.lbl_thermal)
-        gtk_label_set_text(g_app.lbl_thermal, g_app.proxy->thermal_state);
+
+    if (g_app.row_scene)
+        adw_action_row_set_subtitle(ADW_ACTION_ROW(g_app.row_scene),
+                                    p->current_scene ? p->current_scene : "—");
+
+    if (g_app.row_heavy) {
+        adw_action_row_set_subtitle(ADW_ACTION_ROW(g_app.row_heavy),
+            p->is_heavy_load ? "Heavy load active" : "Normal");
+        /* Recolor the row to signal state without a jumping label. */
+        if (p->is_heavy_load)
+            gtk_widget_add_css_class(g_app.row_heavy, "warning");
+        else
+            gtk_widget_remove_css_class(g_app.row_heavy, "warning");
+    }
+
+    if (g_app.row_temp) {
+        char buf[64];
+        g_snprintf(buf, sizeof(buf), "%.1f °C", p->max_temp / 1000.0);
+        adw_action_row_set_subtitle(ADW_ACTION_ROW(g_app.row_temp), buf);
+    }
     if (g_app.temp_bar) {
-        double frac = g_app.proxy->max_temp > 0
-            ? CLAMP((g_app.proxy->max_temp / 1000.0 - 40.0) / 60.0, 0.0, 1.0)
-            : 0.0;
-        gtk_progress_bar_set_fraction(g_app.temp_bar, frac);
+        double frac = p->max_temp > 0
+            ? CLAMP((p->max_temp / 1000.0 - 40.0) / 60.0, 0.0, 1.0) : 0.0;
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(g_app.temp_bar), frac);
     }
-    for (int i = 0; i < g_app.proxy->nr_freqs && i < 8; i++) {
-        if (g_app.freq_labels && g_app.freq_labels[i]) {
-            gchar buf[32];
-            g_snprintf(buf, sizeof(buf), "%.2f GHz", g_app.proxy->freqs[i] / 1000.0);
-            gtk_label_set_text(GTK_LABEL(g_app.freq_labels[i]), buf);
-        }
-        if (g_app.load_labels && g_app.load_labels[i]) {
-            gchar buf[32];
-            g_snprintf(buf, sizeof(buf), "%.0f%%", g_app.proxy->loads[i]);
-            gtk_label_set_text(GTK_LABEL(g_app.load_labels[i]), buf);
-        }
+    if (g_app.row_thermal)
+        adw_action_row_set_subtitle(ADW_ACTION_ROW(g_app.row_thermal),
+                                    p->thermal_state ? p->thermal_state : "—");
+
+    if (g_app.row_active_pid) {
+        char buf[32];
+        if (p->active_pid > 0)
+            g_snprintf(buf, sizeof(buf), "%d", p->active_pid);
+        else
+            g_strlcpy(buf, "None", sizeof(buf));
+        adw_action_row_set_subtitle(ADW_ACTION_ROW(g_app.row_active_pid), buf);
+    }
+    if (g_app.row_tracked) {
+        char buf[48];
+        g_snprintf(buf, sizeof(buf), "%d processes · %d threads",
+                   p->tracked_processes, p->tracked_threads);
+        adw_action_row_set_subtitle(ADW_ACTION_ROW(g_app.row_tracked), buf);
+    }
+
+    for (int i = 0; i < p->nr_freqs && i < UPERF_MAX_CLUSTERS; i++) {
+        if (!g_app.freq_rows[i]) continue;
+        char buf[32];
+        g_snprintf(buf, sizeof(buf), "%.2f GHz", p->freqs[i] / 1000.0);
+        adw_action_row_set_subtitle(ADW_ACTION_ROW(g_app.freq_rows[i]), buf);
+    }
+    for (int i = 0; i < p->nr_loads && i < UPERF_MAX_CPUS; i++) {
+        if (!g_app.load_rows[i]) continue;
+        char buf[32];
+        g_snprintf(buf, sizeof(buf), "%.0f %%", p->loads[i]);
+        adw_action_row_set_subtitle(ADW_ACTION_ROW(g_app.load_rows[i]), buf);
     }
 }
 
-/* Callback helpers to bridge GCallback with our functions */
-static void on_mode_changed(DbusProxy *p, gchar *m, gpointer ud) {
-    (void)p; (void)m; (void)ud;
-    refresh_display();
-}
-static void on_scene_changed(DbusProxy *p, gchar *m, gpointer ud) {
-    (void)p; (void)m; (void)ud;
-    refresh_display();
-}
-static void on_stats_updated(DbusProxy *p, gpointer ud) {
-    (void)p; (void)ud;
-    refresh_display();
-}
-static void on_heavy_changed(DbusProxy *p, gboolean h, gpointer ud) {
-    (void)p; (void)h; (void)ud;
-    refresh_display();
-}
-static void on_thermal_changed(DbusProxy *p, gint32 t, gpointer ud) {
-    (void)p; (void)t; (void)ud;
-    refresh_display();
+/* Signal bridges */
+static void on_mode_changed(DbusProxy *p, gchar *m, gpointer ud)
+{ (void)p; (void)m; (void)ud; refresh_display(); }
+static void on_scene_changed(DbusProxy *p, gchar *m, gpointer ud)
+{ (void)p; (void)m; (void)ud; refresh_display(); }
+static void on_stats_updated(DbusProxy *p, gpointer ud)
+{ (void)p; (void)ud; refresh_display(); refresh_games(); }
+static void on_heavy_changed(DbusProxy *p, gboolean h, gpointer ud)
+{ (void)p; (void)h; (void)ud; refresh_display(); }
+static void on_thermal_changed(DbusProxy *p, gint32 t, gpointer ud)
+{ (void)p; (void)t; (void)ud; refresh_display(); }
+
+/* Mode selector: a linked toggle group. Only react to user activation,
+ * not to programmatic sync in refresh_display(). */
+static void on_mode_toggled(GtkToggleButton *btn, gpointer ud) {
+    if (!gtk_toggle_button_get_active(btn)) return;
+    const char *mode = ud;
+    if (g_app.proxy && !dbus_proxy_set_mode(g_app.proxy, mode))
+        toast("Failed to set power mode");
 }
 
-static void on_set_mode_clicked(GtkButton *btn, const gchar *mode) {
-    if (g_app.proxy) dbus_proxy_set_mode(g_app.proxy, mode);
-    refresh_display();
+/* Games: per-app mode dropdown */
+typedef struct { gint pid; gchar *app; } GameTarget;
+
+static void game_target_free(gpointer data, GClosure *closure) {
+    (void)closure;
+    GameTarget *t = data;
+    if (!t) return;
+    g_free(t->app);
+    g_free(t);
 }
 
-static void on_set_game_mode(GtkDropDown *dropdown, gpointer userdata) {
-    (void)userdata;
+static void on_game_mode_selected(GObject *obj, GParamSpec *pspec, gpointer ud) {
+    (void)pspec;
     if (!g_app.proxy) return;
-    guint idx = gtk_drop_down_get_selected(dropdown);
-    const gchar *modes[] = {"balance", "powersave", "performance"};
-    if (idx < 3) {
-        dbus_proxy_set_game_mode(g_app.proxy, 0, "unknown", modes[idx]);
+    GameTarget *t = ud;
+    guint idx = gtk_drop_down_get_selected(GTK_DROP_DOWN(obj));
+    static const char *modes[] = { "balance", "powersave", "performance", "fast" };
+    if (t && idx < G_N_ELEMENTS(modes))
+        dbus_proxy_set_game_mode(g_app.proxy, t->pid, t->app, modes[idx]);
+}
+
+/* Logs */
+static void on_refresh_logs(GtkButton *btn, gpointer ud) {
+    (void)btn; (void)ud;
+    GtkTextBuffer *buf = gtk_text_view_get_buffer(g_app.log_view);
+    GError *err = NULL;
+    GSubprocess *proc = g_subprocess_new(
+        G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_MERGE, &err,
+        "journalctl", "-u", "uperf-linux.service", "-n", "200", "--no-pager", NULL);
+    if (!proc) {
+        gtk_text_buffer_set_text(buf, err ? err->message : "Unable to start journalctl", -1);
+        g_clear_error(&err);
+        return;
+    }
+    gchar *out = NULL;
+    if (!g_subprocess_communicate_utf8(proc, NULL, NULL, &out, NULL, &err)) {
+        gtk_text_buffer_set_text(buf, err ? err->message : "Unable to read journal", -1);
+        g_clear_error(&err);
+    } else {
+        gtk_text_buffer_set_text(buf, out && *out ? out : "(journal is empty)", -1);
+    }
+    g_free(out);
+    g_object_unref(proc);
+}
+
+static void on_clear_logs(GtkButton *btn, gpointer ud) {
+    (void)btn; (void)ud;
+    gtk_text_buffer_set_text(gtk_text_view_get_buffer(g_app.log_view), "", -1);
+}
+
+/* Settings */
+static void on_reload_config(GtkButton *btn, gpointer ud) {
+    (void)btn; (void)ud;
+    if (g_app.proxy && dbus_proxy_reload_config(g_app.proxy))
+        toast("Configuration reloaded");
+    else
+        toast("Reload failed");
+}
+
+/* Frequency override */
+static void on_freq_toggle(GObject *obj, GParamSpec *pspec, gpointer ud) {
+    (void)pspec; (void)ud;
+    gboolean on = adw_switch_row_get_active(ADW_SWITCH_ROW(obj));
+    for (int i = 0; i < 4; i++)
+        if (g_app.freq_scale_rows[i])
+            gtk_widget_set_sensitive(g_app.freq_scale_rows[i], on);
+}
+
+static void on_apply_freq(GtkButton *btn, gpointer ud) {
+    (void)btn; (void)ud;
+    if (!g_app.proxy || !g_app.freq_toggle) return;
+    if (!adw_switch_row_get_active(ADW_SWITCH_ROW(g_app.freq_toggle))) {
+        dbus_proxy_release_freq_override(g_app.proxy);
+        toast("Override released");
+        return;
+    }
+    /* CPU sliders are in kHz (daemon API wants Hz); GPU slider is already Hz. */
+    gint64 prime = (gint64)gtk_adjustment_get_value(g_app.freq_adj[0]) * 1000;
+    gint64 perf  = (gint64)gtk_adjustment_get_value(g_app.freq_adj[1]) * 1000;
+    gint64 eff   = (gint64)gtk_adjustment_get_value(g_app.freq_adj[2]) * 1000;
+    gint64 gpu   = (gint64)gtk_adjustment_get_value(g_app.freq_adj[3]);
+    if (dbus_proxy_apply_freq_override(g_app.proxy, prime, perf, eff, gpu))
+        toast("Frequency override applied");
+    else {
+        adw_switch_row_set_active(ADW_SWITCH_ROW(g_app.freq_toggle), FALSE);
+        toast("Failed to apply override");
     }
 }
 
-static void on_refresh_logs_clicked(GtkButton *btn, gpointer ud) {
-    (void)btn; (void)ud;
-    GtkTextBuffer *buf = gtk_text_view_get_buffer(g_app.log_view);
-    gtk_text_buffer_set_text(buf,
-        "[info] Logs refreshed\n"
-        "[info] (Production: reads from journald via DBus)\n", -1);
-}
-
-static void on_clear_logs_clicked(GtkButton *btn, gpointer ud) {
-    (void)btn; (void)ud;
-    GtkTextBuffer *buf = gtk_text_view_get_buffer(g_app.log_view);
-    gtk_text_buffer_set_text(buf, "", -1);
-}
-
-static void on_apply_settings_clicked(GtkButton *btn, gpointer ud) {
-    (void)btn; (void)ud;
-    g_debug("Apply settings clicked");
-}
-
-static void on_apply_freq_clicked(GtkButton *btn, gpointer ud) {
-    (void)btn; (void)ud;
-    g_debug("Apply freq override");
-}
-
-static void on_release_freq_clicked(GtkButton *btn, gpointer ud) {
+static void on_release_freq(GtkButton *btn, gpointer ud) {
     (void)btn; (void)ud;
     if (g_app.proxy) dbus_proxy_release_freq_override(g_app.proxy);
-}
-
-static void on_tab_clicked(GtkButton *btn, const gchar *page_name) {
-    (void)btn;
-    gtk_stack_set_visible_child_name(g_app.stack, page_name);
+    if (g_app.freq_toggle)
+        adw_switch_row_set_active(ADW_SWITCH_ROW(g_app.freq_toggle), FALSE);
+    toast("Override released");
 }
 
 /* ----------------------------------------------------------------
- * Dashboard page
+ * Page scaffolding helper: a scrollable AdwPreferencesPage.
+ * ---------------------------------------------------------------- */
+
+static GtkWidget *new_prefs_page(const char *title, const char *icon) {
+    GtkWidget *page = adw_preferences_page_new();
+    adw_preferences_page_set_title(ADW_PREFERENCES_PAGE(page), title);
+    if (icon)
+        adw_preferences_page_set_icon_name(ADW_PREFERENCES_PAGE(page), icon);
+    return page;
+}
+
+static GtkWidget *value_row(GtkWidget *group, const char *title) {
+    GtkWidget *row = adw_action_row_new();
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), title);
+    adw_action_row_set_subtitle(ADW_ACTION_ROW(row), "—");
+    adw_preferences_group_add(ADW_PREFERENCES_GROUP(group), row);
+    return row;
+}
+
+/* ----------------------------------------------------------------
+ * Dashboard
  * ---------------------------------------------------------------- */
 
 static GtkWidget *create_dashboard_page(void) {
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    gtk_box_set_spacing(GTK_BOX(box), 12);
-    gtk_widget_set_margin_top(box, 16);
-    gtk_widget_set_margin_bottom(box, 16);
-    gtk_widget_set_margin_start(box, 16);
-    gtk_widget_set_margin_end(box, 16);
+    GtkWidget *page = new_prefs_page("Dashboard", "speedometer-symbolic");
 
-    /* Title */
-    GtkWidget *title = gtk_label_new(NULL);
-    gtk_label_set_text(GTK_LABEL(title), "uperf-linux");
-    gtk_widget_set_css_classes(title, (const gchar *[]){"heading", NULL});
-    gtk_box_append(GTK_BOX(box), title);
+    /* --- Power mode selector (linked toggle group) --- */
+    GtkWidget *mode_group = adw_preferences_group_new();
+    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(mode_group), "Power Mode");
+    adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
+                             ADW_PREFERENCES_GROUP(mode_group));
 
-    /* SOC badge */
-    GtkWidget *soc = gtk_label_new(NULL);
-    gtk_label_set_text(GTK_LABEL(soc), "SM8550 - Snapdragon 8 Gen 2");
-    gtk_widget_set_css_classes(soc, (const gchar *[]){"caption", NULL});
-    gtk_box_append(GTK_BOX(box), soc);
+    GtkWidget *btn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_add_css_class(btn_box, "linked");
+    gtk_widget_set_margin_top(btn_box, 4);
+    gtk_widget_set_margin_bottom(btn_box, 4);
 
-    /* Power Mode buttons */
-    GtkWidget *mode_frame = adw_clamp_new();
-    gtk_widget_set_valign(mode_frame, GTK_ALIGN_FILL);
-    gtk_widget_set_hexpand(mode_frame, TRUE);
-    GtkWidget *mode_grid = gtk_grid_new();
-    gtk_grid_set_column_spacing(GTK_GRID(mode_grid), 8);
-    gtk_grid_set_row_spacing(GTK_GRID(mode_grid), 8);
-    adw_clamp_set_child(ADW_CLAMP(mode_frame), mode_grid);
-
-    g_app.lbl_mode = GTK_LABEL(gtk_label_new("balance"));
-    gtk_widget_set_css_classes(GTK_WIDGET(g_app.lbl_mode), (const gchar *[]){"caption", NULL});
-    gtk_label_set_justify(g_app.lbl_mode, GTK_JUSTIFY_CENTER);
-
-    const char *modes[] = {"balance", "powersave", "performance"};
-    const char *icons[] = {"B", "P", "X"};
-    const char *labels[] = {"Balance", "Powersave", "Performance"};
-
-    for (int i = 0; i < 3; i++) {
-        GtkWidget *btn = gtk_button_new();
-        gtk_widget_set_css_classes(btn, (const gchar *[]){"flat", NULL});
-        gtk_widget_set_hexpand(btn, TRUE);
-        GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-        gtk_box_set_spacing(GTK_BOX(vbox), 4);
-        GtkWidget *icon = gtk_label_new(icons[i]);
-        g_object_set(icon, "weight", PANGO_WEIGHT_BOLD, NULL);
-        GtkWidget *lbl = gtk_label_new(labels[i]);
-        g_object_set(lbl, "weight", PANGO_WEIGHT_BOLD, NULL);
-        gtk_box_append(GTK_BOX(vbox), icon);
-        gtk_box_append(GTK_BOX(vbox), lbl);
-        gtk_button_set_child(GTK_BUTTON(btn), vbox);
-        g_signal_connect(btn, "clicked", G_CALLBACK(on_set_mode_clicked), (gpointer)modes[i]);
-        gtk_grid_attach(GTK_GRID(mode_grid), btn, i, 0, 1, 1);
+    static const char *modes[]   = { "balance", "powersave", "performance", "fast" };
+    static const char *labels[]  = { "Balance", "Power Save", "Performance", "Fast" };
+    GtkWidget *first = NULL;
+    for (int i = 0; i < 4; i++) {
+        GtkWidget *b = gtk_toggle_button_new_with_label(labels[i]);
+        gtk_widget_set_hexpand(b, TRUE);
+        if (first)
+            gtk_toggle_button_set_group(GTK_TOGGLE_BUTTON(b), GTK_TOGGLE_BUTTON(first));
+        else
+            first = b;
+        g_signal_connect(b, "toggled", G_CALLBACK(on_mode_toggled), (gpointer)modes[i]);
+        g_app.mode_buttons[i] = b;
+        gtk_box_append(GTK_BOX(btn_box), b);
     }
-    gtk_grid_attach(GTK_GRID(mode_grid), GTK_WIDGET(g_app.lbl_mode), 0, 1, 3, 1);
-    gtk_box_append(GTK_BOX(box), mode_frame);
+    adw_preferences_group_add(ADW_PREFERENCES_GROUP(mode_group), btn_box);
 
-    /* Scene badge */
-    g_app.lbl_scene = GTK_LABEL(gtk_label_new("IDLE"));
-    g_object_set(g_app.lbl_scene, "weight", PANGO_WEIGHT_BOLD, NULL);
-    gtk_widget_set_css_classes(GTK_WIDGET(g_app.lbl_scene), (const gchar *[]){"heading", NULL});
-    gtk_box_append(GTK_BOX(box), GTK_WIDGET(g_app.lbl_scene));
+    /* --- Status card --- */
+    GtkWidget *status = adw_preferences_group_new();
+    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(status), "Status");
+    adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
+                             ADW_PREFERENCES_GROUP(status));
+    g_app.row_mode  = value_row(status, "Active Mode");
+    g_app.row_scene = value_row(status, "Scene");
+    g_app.row_heavy = value_row(status, "Load State");
 
-    /* Heavy load */
-    g_app.lbl_heavy = GTK_LABEL(gtk_label_new("Normal"));
-    g_object_set(g_app.lbl_heavy, "weight", PANGO_WEIGHT_BOLD, NULL);
-    gtk_box_append(GTK_BOX(box), GTK_WIDGET(g_app.lbl_heavy));
+    /* --- Scheduler card (affinity / cgroup activity) --- */
+    GtkWidget *sched = adw_preferences_group_new();
+    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(sched), "Scheduler");
+    adw_preferences_group_set_description(ADW_PREFERENCES_GROUP(sched),
+        "Thread affinity and cgroup management activity.");
+    adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
+                             ADW_PREFERENCES_GROUP(sched));
+    g_app.row_active_pid = value_row(sched, "Active Foreground PID");
+    g_app.row_tracked    = value_row(sched, "Managed Processes / Threads");
 
-    /* CPU frequency grid */
-    GtkWidget *freq_frame = adw_clamp_new();
-    gtk_widget_set_valign(freq_frame, GTK_ALIGN_FILL);
-    gtk_widget_set_hexpand(freq_frame, TRUE);
-    GtkWidget *freq_grid = gtk_grid_new();
-    gtk_grid_set_column_spacing(GTK_GRID(freq_grid), 4);
-    gtk_grid_set_row_spacing(GTK_GRID(freq_grid), 4);
-    adw_clamp_set_child(ADW_CLAMP(freq_frame), freq_grid);
+    /* --- Per-cluster frequency card --- */
+    GtkWidget *freq = adw_preferences_group_new();
+    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(freq), "Cluster Frequency");
+    adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
+                             ADW_PREFERENCES_GROUP(freq));
+    for (int i = 0; i < 3; i++)
+        g_app.freq_rows[i] = value_row(freq, CLUSTER_NAMES[i]);
 
-    g_app.freq_labels = g_malloc0(8 * sizeof(GtkWidget *));
-    g_app.load_labels = g_malloc0(8 * sizeof(GtkWidget *));
-
-    for (int i = 0; i < 8; i++) {
-        int col = i % 4;
-        int row = i / 4;
-        GtkWidget *cpu_lbl = gtk_label_new(NULL);
-        gchar cpu_name[16];
-        g_snprintf(cpu_name, sizeof(cpu_name), "CPU%d", i);
-        gtk_label_set_text(GTK_LABEL(cpu_lbl), cpu_name);
-        gtk_widget_set_css_classes(cpu_lbl, (const gchar *[]){"caption", NULL});
-        GtkWidget *freq_lbl = gtk_label_new("--");
-        g_app.freq_labels[i] = freq_lbl;
-        GtkWidget *load_lbl = gtk_label_new("--");
-        g_app.load_labels[i] = load_lbl;
-        gtk_widget_set_css_classes(load_lbl, (const gchar *[]){"caption", NULL});
-
-        GtkWidget *cell = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
-        gtk_box_append(GTK_BOX(cell), cpu_lbl);
-        gtk_box_append(GTK_BOX(cell), freq_lbl);
-        gtk_box_append(GTK_BOX(cell), load_lbl);
-        gtk_grid_attach(GTK_GRID(freq_grid), cell, col, row, 1, 1);
+    /* --- Per-CPU utilization card --- */
+    GtkWidget *load = adw_preferences_group_new();
+    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(load), "CPU Utilization");
+    adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
+                             ADW_PREFERENCES_GROUP(load));
+    for (int i = 0; i < UPERF_MAX_CPUS; i++) {
+        char name[16];
+        g_snprintf(name, sizeof(name), "CPU %d", i);
+        g_app.load_rows[i] = value_row(load, name);
     }
-    gtk_box_append(GTK_BOX(box), freq_frame);
 
-    /* Load bar */
-    g_app.load_bar = GTK_PROGRESS_BAR(gtk_progress_bar_new());
-    gtk_widget_set_hexpand(GTK_WIDGET(g_app.load_bar), TRUE);
-    gtk_box_append(GTK_BOX(box), GTK_WIDGET(g_app.load_bar));
-    gtk_progress_bar_set_fraction(g_app.load_bar, 0.3);
+    /* --- Thermal card (with a real progress bar) --- */
+    GtkWidget *therm = adw_preferences_group_new();
+    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(therm), "Thermal");
+    adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
+                             ADW_PREFERENCES_GROUP(therm));
+    g_app.row_temp    = value_row(therm, "Max Temperature");
+    g_app.row_thermal = value_row(therm, "Thermal State");
 
-    /* Thermal section */
-    GtkWidget *therm_frame = adw_clamp_new();
-    gtk_widget_set_valign(therm_frame, GTK_ALIGN_FILL);
-    gtk_widget_set_hexpand(therm_frame, TRUE);
-    GtkWidget *therm_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    gtk_box_set_spacing(GTK_BOX(therm_box), 8);
-    gtk_widget_set_margin_top(GTK_WIDGET(therm_box), 12);
-    gtk_widget_set_margin_bottom(GTK_WIDGET(therm_box), 12);
-    gtk_widget_set_margin_start(GTK_WIDGET(therm_box), 12);
-    gtk_widget_set_margin_end(GTK_WIDGET(therm_box), 12);
-    adw_clamp_set_child(ADW_CLAMP(therm_frame), therm_box);
+    g_app.temp_bar = gtk_progress_bar_new();
+    gtk_widget_set_hexpand(g_app.temp_bar, TRUE);
+    gtk_widget_set_margin_top(g_app.temp_bar, 6);
+    gtk_widget_set_margin_bottom(g_app.temp_bar, 6);
+    gtk_widget_set_margin_start(g_app.temp_bar, 6);
+    gtk_widget_set_margin_end(g_app.temp_bar, 6);
+    adw_preferences_group_add(ADW_PREFERENCES_GROUP(therm), g_app.temp_bar);
 
-    g_app.lbl_max_temp = GTK_LABEL(gtk_label_new("-- C"));
-    g_object_set(g_app.lbl_max_temp, "weight", PANGO_WEIGHT_BOLD, NULL);
-    gtk_widget_set_css_classes(GTK_WIDGET(g_app.lbl_max_temp), (const gchar *[]){"heading", NULL});
-    gtk_box_append(GTK_BOX(therm_box), GTK_WIDGET(g_app.lbl_max_temp));
-
-    g_app.lbl_thermal = GTK_LABEL(gtk_label_new("NORMAL"));
-    gtk_box_append(GTK_BOX(therm_box), GTK_WIDGET(g_app.lbl_thermal));
-
-    g_app.temp_bar = GTK_PROGRESS_BAR(gtk_progress_bar_new());
-    gtk_widget_set_hexpand(GTK_WIDGET(g_app.temp_bar), TRUE);
-    gtk_box_append(GTK_BOX(therm_box), GTK_WIDGET(g_app.temp_bar));
-
-    gtk_box_append(GTK_BOX(box), therm_frame);
-
-    return box;
+    return page;
 }
 
 /* ----------------------------------------------------------------
- * Games page
+ * Games
  * ---------------------------------------------------------------- */
 
 static void refresh_games(void) {
-    if (!g_app.game_list || !g_app.proxy) return;
+    if (!g_app.games_group || !g_app.proxy) return;
 
-    GtkWidget *child = gtk_widget_get_first_child(GTK_WIDGET(g_app.game_list));
-    while (child) {
-        GtkWidget *next = gtk_widget_get_next_sibling(child);
-        gtk_list_box_remove(g_app.game_list, child);
-        child = next;
+    /* Remove previously-added rows. */
+    for (int i = 0; i < g_app.game_rows_len; i++) {
+        if (g_app.game_rows[i])
+            adw_preferences_group_remove(ADW_PREFERENCES_GROUP(g_app.games_group),
+                                         g_app.game_rows[i]);
     }
+    g_free(g_app.game_rows);
+    g_app.game_rows = NULL;
+    g_app.game_rows_len = 0;
 
-    for (int i = 0; i < g_app.proxy->nr_games; i++) {
-        GtkWidget *row = gtk_list_box_row_new();
-        GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
-        gtk_widget_set_margin_top(hbox, 8);
-        gtk_widget_set_margin_bottom(hbox, 8);
-        gtk_widget_set_margin_start(hbox, 8);
-        gtk_widget_set_margin_end(hbox, 8);
+    int n = g_app.proxy->nr_games;
+    gtk_widget_set_visible(g_app.games_placeholder, n == 0);
+    if (n == 0) return;
 
-        GtkWidget *icon = gtk_label_new("G");
-        g_object_set(icon, "weight", PANGO_WEIGHT_BOLD, NULL);
+    g_app.game_rows = g_malloc0(n * sizeof(GtkWidget *));
+    g_app.game_rows_len = n;
 
-        GtkWidget *name_lbl = gtk_label_new(g_app.proxy->game_comm[i]);
-        g_object_set(name_lbl, "weight", PANGO_WEIGHT_BOLD, NULL);
+    static const char *choices[] = { "balance", "powersave", "performance", "fast", NULL };
 
-        GtkWidget *detail_lbl = gtk_label_new(NULL);
-        gchar detail[256];
-        g_snprintf(detail, sizeof(detail), "PID: %d", g_app.proxy->game_pid[i]);
-        gtk_label_set_text(GTK_LABEL(detail_lbl), detail);
-        gtk_widget_set_css_classes(detail_lbl, (const gchar *[]){"caption", NULL});
-
-        /* Use GtkDropDown instead of deprecated gtk_combo_box_string_new */
-        const gchar *choices[] = {"balance", "powersave", "performance", NULL};
-        GtkStringList *strlist = gtk_string_list_new(choices);
-        GtkWidget *dropdown = gtk_drop_down_new(G_LIST_MODEL(strlist), NULL);
-        g_object_unref(strlist);
-
-        const gchar *cur = g_app.proxy->game_mode[i];
-        if (cur) {
-            /* Find index by string comparison */
-            for (guint j = 0; j < 3; j++) {
-                const gchar *s = gtk_string_list_get_string(strlist, j);
-                if (g_strcmp0(s, cur) == 0) {
-                    gtk_drop_down_set_selected(GTK_DROP_DOWN(dropdown), j);
-                    break;
-                }
+    for (int i = 0; i < n; i++) {
+        GtkWidget *row = adw_action_row_new();
+        adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row),
+                                      g_app.proxy->game_comm[i]);
+        /* Look up the cgroup class the scheduler assigned to this PID. */
+        const char *cls = NULL;
+        for (int w = 0; w < g_app.proxy->nr_workloads; w++) {
+            if (g_app.proxy->wl_pid[w] == g_app.proxy->game_pid[i]) {
+                cls = g_app.proxy->wl_class[w];
+                break;
             }
         }
-        g_signal_connect(dropdown, "notify::selected", G_CALLBACK(on_set_game_mode), NULL);
+        char sub[96];
+        if (cls && *cls && g_strcmp0(cls, "—") != 0)
+            g_snprintf(sub, sizeof(sub), "PID %d · class: %s",
+                       g_app.proxy->game_pid[i], cls);
+        else
+            g_snprintf(sub, sizeof(sub), "PID %d · unmanaged",
+                       g_app.proxy->game_pid[i]);
+        adw_action_row_set_subtitle(ADW_ACTION_ROW(row), sub);
+        adw_action_row_add_prefix(ADW_ACTION_ROW(row),
+            gtk_image_new_from_icon_name("applications-games-symbolic"));
 
-        gtk_box_append(GTK_BOX(hbox), icon);
-        gtk_box_append(GTK_BOX(hbox), name_lbl);
-        gtk_box_append(GTK_BOX(hbox), detail_lbl);
-        gtk_box_append(GTK_BOX(hbox), dropdown);
+        GtkStringList *list = gtk_string_list_new(choices);
+        GtkWidget *dd = gtk_drop_down_new(G_LIST_MODEL(list), NULL);
+        gtk_widget_set_valign(dd, GTK_ALIGN_CENTER);
+        g_object_unref(list);
 
-        gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), hbox);
-        gtk_list_box_insert(g_app.game_list, row, -1);
+        const gchar *cur = g_app.proxy->game_mode[i];
+        for (guint j = 0; choices[j]; j++)
+            if (!g_strcmp0(choices[j], cur)) {
+                gtk_drop_down_set_selected(GTK_DROP_DOWN(dd), j);
+                break;
+            }
+
+        GameTarget *t = g_new0(GameTarget, 1);
+        t->pid = g_app.proxy->game_pid[i];
+        t->app = g_strdup(g_app.proxy->game_comm[i]);
+        g_signal_connect_data(dd, "notify::selected",
+                              G_CALLBACK(on_game_mode_selected), t,
+                              game_target_free, 0);
+
+        adw_action_row_add_suffix(ADW_ACTION_ROW(row), dd);
+        adw_preferences_group_add(ADW_PREFERENCES_GROUP(g_app.games_group), row);
+        g_app.game_rows[i] = row;
     }
 }
 
 static GtkWidget *create_games_page(void) {
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    gtk_box_set_spacing(GTK_BOX(box), 12);
-    gtk_widget_set_margin_top(box, 16);
-    gtk_widget_set_margin_bottom(box, 16);
-    gtk_widget_set_margin_start(box, 16);
-    gtk_widget_set_margin_end(box, 16);
+    GtkWidget *page = new_prefs_page("Games", "applications-games-symbolic");
 
-    GtkWidget *title = gtk_label_new(NULL);
-    gtk_label_set_text(GTK_LABEL(title), "Detected Games");
-    gtk_widget_set_css_classes(title, (const gchar *[]){"heading", NULL});
-    gtk_box_append(GTK_BOX(box), title);
+    g_app.games_group = adw_preferences_group_new();
+    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(g_app.games_group),
+                                    "Detected Games");
+    adw_preferences_group_set_description(ADW_PREFERENCES_GROUP(g_app.games_group),
+        "Running game and game-like processes. Assign a per-app power mode.");
+    adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
+                             ADW_PREFERENCES_GROUP(g_app.games_group));
 
-    GtkWidget *hint = gtk_label_new(NULL);
-    gtk_label_set_text(GTK_LABEL(hint), "Running game and game-like processes");
-    gtk_widget_set_css_classes(hint, (const gchar *[]){"caption", NULL});
-    gtk_box_append(GTK_BOX(box), hint);
+    /* Placeholder shown when nothing is detected. */
+    g_app.games_placeholder = adw_action_row_new();
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(g_app.games_placeholder),
+                                  "No games detected");
+    adw_action_row_set_subtitle(ADW_ACTION_ROW(g_app.games_placeholder),
+                                "Launch a game and it will appear here.");
+    adw_preferences_group_add(ADW_PREFERENCES_GROUP(g_app.games_group),
+                              g_app.games_placeholder);
 
-    g_app.game_list = GTK_LIST_BOX(gtk_list_box_new());
-    gtk_widget_set_vexpand(GTK_WIDGET(g_app.game_list), TRUE);
-    gtk_widget_set_hexpand(GTK_WIDGET(g_app.game_list), TRUE);
-    gtk_list_box_set_selection_mode(g_app.game_list, GTK_SELECTION_NONE);
-    gtk_box_append(GTK_BOX(box), GTK_WIDGET(g_app.game_list));
-
-    return box;
+    return page;
 }
 
 /* ----------------------------------------------------------------
- * Settings page
- * ---------------------------------------------------------------- */
-
-static GtkWidget *create_settings_page(void) {
-    /* Create a proper AdwPreferencesWindow with AdwPreferencesPage */
-    GtkWidget *window = adw_preferences_window_new();
-
-    /* Create a page and add it to the window */
-    GtkWidget *page = adw_preferences_page_new();
-    adw_preferences_page_set_title(ADW_PREFERENCES_PAGE(page), "Settings");
-
-    /* Helper: create a group with title and add rows */
-    struct GroupDef {
-        const char *title;
-        struct {
-            const char *name;
-            const char *desc;
-            const char *init;
-        } rows[4];
-        int nr;
-    };
-
-    struct GroupDef groups[] = {
-        { "Load Detection", {
-            { "HeavyLoad Threshold", "System load % above which boost mode activates", "60" },
-            { "Idle Load Threshold", "Load % below which boost mode deactivates", "20" },
-            { "Sample Time", "Interval between /proc/stat samples (ms)", "10" },
-            { "Burst Slack", "Cooldown before re-entering boost (ms)", "3000" },
-        }, 4 },
-        { "Response Timing", {
-            { "Latency Time", "Response delay before boosting frequency (ms)", "200" },
-            { "Margin", "Headroom multiplier for frequency selection (%)", "25" },
-            { "Burst", "Additional burst intensity modifier (%)", "0" },
-            { "", NULL, NULL },
-        }, 3 },
-        { "Power Budgets", {
-            { "Slow Limit", "Power budget for slow response mode (Watts)", "3.0" },
-            { "Fast Limit", "Power budget for fast response mode (Watts)", "6.0" },
-            { "Fast Limit Capacity", "Maximum capacity cap during burst", "10.0" },
-            { "", NULL, NULL },
-        }, 3 },
-        { "Thermal Thresholds", {
-            { "Warn Temp", "Temperature at which warnings are logged (C)", "70" },
-            { "Throttle Temp", "Temperature at which CPU/GPU frequency is reduced (C)", "80" },
-            { "Critical Temp", "Emergency threshold (C)", "95" },
-            { "Recovery Temp", "Temperature below which normal operation resumes (C)", "75" },
-        }, 4 },
-    };
-
-    for (int gi = 0; gi < 4; gi++) {
-        GtkWidget *grp = adw_preferences_group_new();
-        g_object_set(grp, "title", groups[gi].title, NULL);
-
-        for (int ri = 0; ri < groups[gi].nr; ri++) {
-            GtkWidget *row = adw_entry_row_new();
-            g_object_set(row,
-                "title", groups[gi].rows[ri].name,
-                "subtitle", groups[gi].rows[ri].desc,
-                NULL);
-            g_object_set(row, "numeric", TRUE, NULL);
-            /* Set initial value via the "text" property on the entry row */
-            if (groups[gi].rows[ri].init[0]) {
-                g_object_set(row, "text", groups[gi].rows[ri].init, NULL);
-                g_object_set(row, "width-chars", 6, NULL);
-            }
-            adw_preferences_group_add(ADW_PREFERENCES_GROUP(grp), row);
-        }
-        adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
-            ADW_PREFERENCES_GROUP(grp));
-    }
-
-    adw_preferences_window_add(ADW_PREFERENCES_WINDOW(window),
-        ADW_PREFERENCES_PAGE(page));
-
-    /* Apply button removed - not available in this libadwaita 1.5 version */
-
-    return window;
-}
-
-/* ----------------------------------------------------------------
- * Logs page
- * ---------------------------------------------------------------- */
-
-static GtkWidget *create_logs_page(void) {
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    gtk_box_set_spacing(GTK_BOX(box), 8);
-    gtk_widget_set_margin_top(box, 16);
-    gtk_widget_set_margin_bottom(box, 16);
-    gtk_widget_set_margin_start(box, 16);
-    gtk_widget_set_margin_end(box, 16);
-
-    GtkWidget *title = gtk_label_new(NULL);
-    gtk_label_set_text(GTK_LABEL(title), "Log Output");
-    gtk_widget_set_css_classes(title, (const gchar *[]){"heading", NULL});
-    gtk_box_append(GTK_BOX(box), title);
-
-    GtkTextBuffer *buf = gtk_text_buffer_new(NULL);
-    g_app.log_view = GTK_TEXT_VIEW(gtk_text_view_new_with_buffer(buf));
-    gtk_text_view_set_editable(g_app.log_view, FALSE);
-    gtk_text_view_set_wrap_mode(g_app.log_view, GTK_WRAP_WORD_CHAR);
-    gtk_text_view_set_monospace(g_app.log_view, TRUE);
-
-    GtkWidget *scroll = gtk_scrolled_window_new();
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
-        GTK_POLICY_NEVER, GTK_POLICY_ALWAYS);
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), GTK_WIDGET(g_app.log_view));
-    gtk_box_append(GTK_BOX(box), scroll);
-
-    gtk_text_buffer_set_text(buf,
-        "[info] uperf-linux daemon started\n"
-        "[info] Config loaded: sm8550 by uperf-linux\n"
-        "[info] DBus manager created on system bus\n"
-        "[info] CgroupManager initialized\n"
-        "[info] HeavyLoadDetector created: nr_cpus=8\n"
-        "[info] InputMonitor: no touchscreen devices found\n"
-        "[info] === uperf-linux ready ===\n", -1);
-
-    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *refresh_btn = gtk_button_new_with_label("Refresh");
-    gtk_widget_set_css_classes(refresh_btn, (const gchar *[]){"flat", NULL});
-    g_signal_connect(refresh_btn, "clicked", G_CALLBACK(on_refresh_logs_clicked), NULL);
-    gtk_box_append(GTK_BOX(hbox), refresh_btn);
-
-    GtkWidget *clear_btn = gtk_button_new_with_label("Clear");
-    gtk_widget_set_css_classes(clear_btn, (const gchar *[]){"flat", NULL});
-    g_signal_connect(clear_btn, "clicked", G_CALLBACK(on_clear_logs_clicked), NULL);
-    gtk_box_append(GTK_BOX(hbox), clear_btn);
-
-    gtk_box_append(GTK_BOX(box), hbox);
-    return box;
-}
-
-/* ----------------------------------------------------------------
- * Frequency override page
+ * Frequency override
  * ---------------------------------------------------------------- */
 
 static GtkWidget *create_frequency_page(void) {
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    gtk_box_set_spacing(GTK_BOX(box), 12);
-    gtk_widget_set_margin_top(box, 16);
-    gtk_widget_set_margin_bottom(box, 16);
-    gtk_widget_set_margin_start(box, 16);
-    gtk_widget_set_margin_end(box, 16);
+    GtkWidget *page = new_prefs_page("Frequency", "power-profile-performance-symbolic");
 
-    GtkWidget *title = gtk_label_new(NULL);
-    gtk_label_set_text(GTK_LABEL(title), "Manual Frequency Override");
-    gtk_widget_set_css_classes(title, (const gchar *[]){"heading", NULL});
-    gtk_box_append(GTK_BOX(box), title);
-
-    GtkWidget *hint = gtk_label_new(NULL);
-    gtk_label_set_text(GTK_LABEL(hint), "Lock CPU/GPU frequency to a fixed value. Set to 0 to release back to auto-scaling.");
-    gtk_label_set_wrap(GTK_LABEL(hint), TRUE);
-    gtk_widget_set_css_classes(hint, (const gchar *[]){"caption", NULL});
-    gtk_box_append(GTK_BOX(box), hint);
+    GtkWidget *group = adw_preferences_group_new();
+    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(group),
+                                    "Manual Frequency Override");
+    adw_preferences_group_set_description(ADW_PREFERENCES_GROUP(group),
+        "Lock each cluster to a fixed frequency. Disable to return to "
+        "automatic scaling.");
+    adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
+                             ADW_PREFERENCES_GROUP(group));
 
     /* Enable toggle */
-    GtkWidget *toggle_row = adw_action_row_new();
-    GtkWidget *toggle = gtk_switch_new();
-    g_object_set(toggle_row, "title", "Override Enabled", NULL);
-    adw_action_row_set_activatable_widget(ADW_ACTION_ROW(toggle_row), toggle);
-    gtk_box_append(GTK_BOX(box), toggle_row);
+    g_app.freq_toggle = adw_switch_row_new();
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(g_app.freq_toggle),
+                                  "Override Enabled");
+    g_signal_connect(g_app.freq_toggle, "notify::active",
+                     G_CALLBACK(on_freq_toggle), NULL);
+    adw_preferences_group_add(ADW_PREFERENCES_GROUP(group), g_app.freq_toggle);
 
-    struct { const char *title; gdouble min; gdouble max; gdouble def; } clusters[] = {
-        { "CPU Prime (cpu0)", 600000, 3200000, 2400000 },
-        { "CPU Performance (cpu1-2)", 500000, 2800000, 2200000 },
-        { "CPU Efficiency (cpu3-7)", 300000, 2000000, 1600000 },
-        { "GPU", 300000000, 1000000000, 600000000 },
+    struct { const char *title; const char *unit; gdouble min, max, def; } cl[] = {
+        { "Prime",       "kHz", 595200,    2956800,   2956800   },
+        { "Performance", "kHz", 499200,    2803200,   2803200   },
+        { "Efficiency",  "kHz", 307200,    2016000,   2016000   },
+        { "GPU",         "Hz",  220000000, 680000000, 680000000 },
     };
 
     for (int i = 0; i < 4; i++) {
-        GtkWidget *frame = adw_clamp_new();
-        gtk_widget_set_valign(frame, GTK_ALIGN_FILL);
-        gtk_widget_set_hexpand(frame, TRUE);
-        GtkWidget *slider_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-        gtk_box_set_spacing(GTK_BOX(slider_box), 4);
-        gtk_widget_set_margin_top(slider_box, 12);
-        gtk_widget_set_margin_bottom(slider_box, 12);
-        gtk_widget_set_margin_start(slider_box, 12);
-        gtk_widget_set_margin_end(slider_box, 12);
-        adw_clamp_set_child(ADW_CLAMP(frame), slider_box);
+        /* AdwActionRow holds the label; a scale sits in the row body below. */
+        GtkWidget *row = adw_action_row_new();
+        char title[64];
+        g_snprintf(title, sizeof(title), "%s (%s)", cl[i].title, cl[i].unit);
+        adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), title);
 
-        GtkAdjustment *adj = gtk_adjustment_new(clusters[i].def,
-            clusters[i].min, clusters[i].max, 50000, 100000, 0);
-        GtkWidget *slider = gtk_scale_new(GTK_ORIENTATION_HORIZONTAL, adj);
-        gtk_scale_set_draw_value(GTK_SCALE(slider), TRUE);
-        gtk_widget_set_hexpand(slider, TRUE);
-        gtk_box_append(GTK_BOX(slider_box), slider);
+        g_app.freq_adj[i] = gtk_adjustment_new(cl[i].def, cl[i].min, cl[i].max,
+                                               50000, 100000, 0);
+        GtkWidget *scale = gtk_scale_new(GTK_ORIENTATION_HORIZONTAL, g_app.freq_adj[i]);
+        gtk_scale_set_draw_value(GTK_SCALE(scale), TRUE);
+        gtk_scale_set_value_pos(GTK_SCALE(scale), GTK_POS_RIGHT);
+        gtk_widget_set_hexpand(scale, TRUE);
+        gtk_widget_set_size_request(scale, 260, -1);
+        gtk_widget_set_valign(scale, GTK_ALIGN_CENTER);
+        adw_action_row_add_suffix(ADW_ACTION_ROW(row), scale);
 
-        gtk_box_append(GTK_BOX(box), frame);
+        gtk_widget_set_sensitive(row, FALSE);  /* until override enabled */
+        g_app.freq_scale_rows[i] = row;
+        adw_preferences_group_add(ADW_PREFERENCES_GROUP(group), row);
     }
 
-    /* Buttons */
+    /* Action buttons */
+    GtkWidget *btns = adw_preferences_group_new();
+    adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
+                             ADW_PREFERENCES_GROUP(btns));
     GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_append(GTK_BOX(box), hbox);
+    gtk_widget_set_halign(hbox, GTK_ALIGN_CENTER);
 
-    GtkWidget *apply_btn = gtk_button_new_with_label("Apply");
-    gtk_widget_set_hexpand(apply_btn, TRUE);
-    gtk_widget_set_css_classes(apply_btn, (const gchar *[]){"suggested-action", "pill", NULL});
-    g_signal_connect(apply_btn, "clicked", G_CALLBACK(on_apply_freq_clicked), NULL);
-    gtk_box_append(GTK_BOX(hbox), apply_btn);
+    GtkWidget *apply = gtk_button_new_with_label("Apply");
+    gtk_widget_add_css_class(apply, "suggested-action");
+    gtk_widget_add_css_class(apply, "pill");
+    g_signal_connect(apply, "clicked", G_CALLBACK(on_apply_freq), NULL);
+    gtk_box_append(GTK_BOX(hbox), apply);
 
-    GtkWidget *release_btn = gtk_button_new_with_label("Release All");
-    gtk_widget_set_css_classes(release_btn, (const gchar *[]){"destructive-action", "pill", NULL});
-    g_signal_connect(release_btn, "clicked", G_CALLBACK(on_release_freq_clicked), NULL);
-    gtk_box_append(GTK_BOX(hbox), release_btn);
+    GtkWidget *release = gtk_button_new_with_label("Release All");
+    gtk_widget_add_css_class(release, "pill");
+    g_signal_connect(release, "clicked", G_CALLBACK(on_release_freq), NULL);
+    gtk_box_append(GTK_BOX(hbox), release);
 
-    return box;
+    adw_preferences_group_add(ADW_PREFERENCES_GROUP(btns), hbox);
+    return page;
 }
 
 /* ----------------------------------------------------------------
- * Activate handler (pure C, no lambdas)
+ * Settings
+ * ---------------------------------------------------------------- */
+
+static GtkWidget *create_settings_page(void) {
+    GtkWidget *page = new_prefs_page("Settings", "emblem-system-symbolic");
+
+    GtkWidget *group = adw_preferences_group_new();
+    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(group),
+                                    "Daemon Configuration");
+    adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
+                             ADW_PREFERENCES_GROUP(group));
+
+    GtkWidget *row = adw_action_row_new();
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row),
+                                  "/etc/uperf-linux/config.json");
+    adw_action_row_set_subtitle(ADW_ACTION_ROW(row),
+        "Edit the JSON with administrator privileges, then reload it here.");
+    GtkWidget *reload = gtk_button_new_with_label("Reload");
+    gtk_widget_set_valign(reload, GTK_ALIGN_CENTER);
+    g_signal_connect(reload, "clicked", G_CALLBACK(on_reload_config), NULL);
+    adw_action_row_add_suffix(ADW_ACTION_ROW(row), reload);
+    adw_preferences_group_add(ADW_PREFERENCES_GROUP(group), row);
+
+    return page;
+}
+
+/* ----------------------------------------------------------------
+ * Logs
+ * ---------------------------------------------------------------- */
+
+static GtkWidget *create_logs_page(void) {
+    GtkWidget *page = new_prefs_page("Logs", "text-x-generic-symbolic");
+
+    GtkWidget *group = adw_preferences_group_new();
+    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(group), "Service Journal");
+    adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
+                             ADW_PREFERENCES_GROUP(group));
+
+    GtkWidget *buf_holder = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(buf_holder),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(buf_holder, -1, 320);
+    gtk_widget_add_css_class(buf_holder, "card");
+
+    GtkTextBuffer *buf = gtk_text_buffer_new(NULL);
+    gtk_text_buffer_set_text(buf,
+        "Press Refresh to load the latest uperf-linux.service journal.\n", -1);
+    g_app.log_view = GTK_TEXT_VIEW(gtk_text_view_new_with_buffer(buf));
+    gtk_text_view_set_editable(g_app.log_view, FALSE);
+    gtk_text_view_set_monospace(g_app.log_view, TRUE);
+    gtk_text_view_set_wrap_mode(g_app.log_view, GTK_WRAP_WORD_CHAR);
+    gtk_widget_set_margin_top(GTK_WIDGET(g_app.log_view), 6);
+    gtk_widget_set_margin_bottom(GTK_WIDGET(g_app.log_view), 6);
+    gtk_widget_set_margin_start(GTK_WIDGET(g_app.log_view), 6);
+    gtk_widget_set_margin_end(GTK_WIDGET(g_app.log_view), 6);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(buf_holder),
+                                  GTK_WIDGET(g_app.log_view));
+    adw_preferences_group_add(ADW_PREFERENCES_GROUP(group), buf_holder);
+
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_halign(hbox, GTK_ALIGN_CENTER);
+    gtk_widget_set_margin_top(hbox, 8);
+    GtkWidget *refresh = gtk_button_new_with_label("Refresh");
+    gtk_widget_add_css_class(refresh, "pill");
+    g_signal_connect(refresh, "clicked", G_CALLBACK(on_refresh_logs), NULL);
+    gtk_box_append(GTK_BOX(hbox), refresh);
+    GtkWidget *clear = gtk_button_new_with_label("Clear");
+    gtk_widget_add_css_class(clear, "pill");
+    g_signal_connect(clear, "clicked", G_CALLBACK(on_clear_logs), NULL);
+    gtk_box_append(GTK_BOX(hbox), clear);
+    adw_preferences_group_add(ADW_PREFERENCES_GROUP(group), hbox);
+
+    return page;
+}
+
+/* ----------------------------------------------------------------
+ * Window assembly
  * ---------------------------------------------------------------- */
 
 static void on_activate(GtkApplication *app, gpointer ud) {
@@ -589,69 +645,92 @@ static void on_activate(GtkApplication *app, gpointer ud) {
 
     GtkWidget *window = adw_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(window), "uperf-linux");
-    gtk_window_set_default_size(GTK_WINDOW(window), 1080, 2400);
+    gtk_window_set_default_size(GTK_WINDOW(window), 480, 720);
 
-    /* Stack with pages */
-    g_app.stack = GTK_STACK(gtk_stack_new());
-    gtk_stack_set_transition_type(g_app.stack,
-        GTK_STACK_TRANSITION_TYPE_CROSSFADE);
-    gtk_stack_set_transition_duration(g_app.stack, 200);
+    /* Responsive view stack + switcher (title-bar on desktop, bottom bar
+     * on narrow displays via AdwViewSwitcherBar). */
+    GtkWidget *view_stack = adw_view_stack_new();
 
-    gtk_stack_add_named(g_app.stack,
-        create_dashboard_page(), "dashboard");
-    gtk_stack_add_named(g_app.stack,
-        create_games_page(), "games");
-    gtk_stack_add_named(g_app.stack,
-        create_settings_page(), "settings");
-    gtk_stack_add_named(g_app.stack,
-        create_logs_page(), "logs");
-    gtk_stack_add_named(g_app.stack,
-        create_frequency_page(), "frequency");
-
-    /* Header bar as bottom nav */
-    GtkWidget *tab_bar = gtk_header_bar_new();
-    gtk_header_bar_set_show_title_buttons(GTK_HEADER_BAR(tab_bar), FALSE);
-    gtk_window_set_titlebar(GTK_WINDOW(window), tab_bar);
-
-    struct { const char *label; const char *page; } tabs[] = {
-        { "Dashboard",  "dashboard" },
-        { "Games",      "games" },
-        { "Settings",   "settings" },
-        { "Logs",       "logs" },
-        { "Freq",       "frequency" },
+    struct { GtkWidget *(*build)(void); const char *name, *title, *icon; } pages[] = {
+        { create_dashboard_page, "dashboard", "Dashboard", "speedometer-symbolic" },
+        { create_games_page,     "games",     "Games",     "applications-games-symbolic" },
+        { create_frequency_page, "frequency", "Frequency", "power-profile-performance-symbolic" },
+        { create_settings_page,  "settings",  "Settings",  "emblem-system-symbolic" },
+        { create_logs_page,      "logs",      "Logs",      "text-x-generic-symbolic" },
     };
     for (int i = 0; i < 5; i++) {
-        GtkWidget *btn = gtk_button_new_with_label(tabs[i].label);
-        gtk_widget_set_css_classes(btn, (const gchar *[]){"flat", "pill", NULL});
-        gtk_widget_set_hexpand(btn, TRUE);
-        g_signal_connect(btn, "clicked", G_CALLBACK(on_tab_clicked),
-            (gpointer)tabs[i].page);
-        gtk_header_bar_pack_start(GTK_HEADER_BAR(tab_bar), btn);
+        AdwViewStackPage *sp = adw_view_stack_add_titled(
+            ADW_VIEW_STACK(view_stack), pages[i].build(),
+            pages[i].name, pages[i].title);
+        adw_view_stack_page_set_icon_name(sp, pages[i].icon);
     }
 
-    adw_window_set_content(ADW_WINDOW(window), GTK_WIDGET(g_app.stack));
+    /* Header carries a wide view switcher; on narrow widths a breakpoint
+     * hides it and reveals the bottom switcher bar instead. */
+    GtkWidget *header = adw_header_bar_new();
+    GtkWidget *switcher = adw_view_switcher_new();
+    adw_view_switcher_set_stack(ADW_VIEW_SWITCHER(switcher),
+                                ADW_VIEW_STACK(view_stack));
+    adw_view_switcher_set_policy(ADW_VIEW_SWITCHER(switcher),
+                                 ADW_VIEW_SWITCHER_POLICY_WIDE);
+    adw_header_bar_set_title_widget(ADW_HEADER_BAR(header), switcher);
+
+    GtkWidget *switcher_bar = adw_view_switcher_bar_new();
+    adw_view_switcher_bar_set_stack(ADW_VIEW_SWITCHER_BAR(switcher_bar),
+                                    ADW_VIEW_STACK(view_stack));
+
+    GtkWidget *toolbar = adw_toolbar_view_new();
+    adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(toolbar), header);
+    adw_toolbar_view_add_bottom_bar(ADW_TOOLBAR_VIEW(toolbar), switcher_bar);
+    adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(toolbar), view_stack);
+
+    g_app.toasts = ADW_TOAST_OVERLAY(adw_toast_overlay_new());
+    adw_toast_overlay_set_child(g_app.toasts, toolbar);
+
+    adw_application_window_set_content(ADW_APPLICATION_WINDOW(window),
+                                       GTK_WIDGET(g_app.toasts));
+
+    /* Narrow layout: hide the header switcher, reveal the bottom bar. */
+    AdwBreakpoint *bp = adw_breakpoint_new(
+        adw_breakpoint_condition_parse("max-width: 500px"));
+    GValue v_false = G_VALUE_INIT;
+    g_value_init(&v_false, G_TYPE_BOOLEAN);
+    g_value_set_boolean(&v_false, FALSE);
+    GValue v_true = G_VALUE_INIT;
+    g_value_init(&v_true, G_TYPE_BOOLEAN);
+    g_value_set_boolean(&v_true, TRUE);
+    adw_breakpoint_add_setter(bp, G_OBJECT(switcher), "visible", &v_false);
+    adw_breakpoint_add_setter(bp, G_OBJECT(switcher_bar), "reveal", &v_true);
+    g_value_unset(&v_false);
+    g_value_unset(&v_true);
+    adw_application_window_add_breakpoint(ADW_APPLICATION_WINDOW(window), bp);
+
+    refresh_display();
+    refresh_games();
     gtk_window_present(GTK_WINDOW(window));
 }
 
 int main(int argc, char **argv) {
     adw_init();
 
-    /* Create DBus proxy */
     DbusProxy *proxy = g_object_new(UPERF_TYPE_DBUS_PROXY, NULL);
     g_app.proxy = proxy;
     dbus_proxy_start_polling(proxy);
 
-    /* Live update callbacks */
-    dbus_proxy_set_mode_cb(proxy, G_CALLBACK(on_mode_changed), NULL);
-    dbus_proxy_set_scene_cb(proxy, G_CALLBACK(on_scene_changed), NULL);
-    dbus_proxy_set_stats_cb(proxy, G_CALLBACK(on_stats_updated), NULL);
-    dbus_proxy_set_heavy_cb(proxy, G_CALLBACK(on_heavy_changed), NULL);
+    dbus_proxy_set_mode_cb(proxy,    G_CALLBACK(on_mode_changed),    NULL);
+    dbus_proxy_set_scene_cb(proxy,   G_CALLBACK(on_scene_changed),   NULL);
+    dbus_proxy_set_stats_cb(proxy,   G_CALLBACK(on_stats_updated),   NULL);
+    dbus_proxy_set_heavy_cb(proxy,   G_CALLBACK(on_heavy_changed),   NULL);
     dbus_proxy_set_thermal_cb(proxy, G_CALLBACK(on_thermal_changed), NULL);
 
-    /* Application */
-    GtkApplication *app = gtk_application_new("org.uperflinux.gui",
-        G_APPLICATION_DEFAULT_FLAGS);
+    AdwApplication *app = adw_application_new("org.uperflinux.gui",
+                                              G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(app, "activate", G_CALLBACK(on_activate), NULL);
 
-    return g_application_run(G_APPLICATION(app), argc, argv);
+    int status = g_application_run(G_APPLICATION(app), argc, argv);
+
+    g_clear_object(&app);
+    g_clear_object(&proxy);
+    g_clear_pointer(&g_app.game_rows, g_free);
+    return status;
 }

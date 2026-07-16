@@ -26,16 +26,15 @@ SysfsWriter *sysfs_writer_new(const Config *cfg, uint64_t batch_window_ns);
 /* Destroy and free a sysfs writer. Flushes any pending writes first. */
 void sysfs_writer_free(SysfsWriter *w);
 
-/* Queue an action's knob values for writing.
- * Called by the state machine when transitioning between states. */
-void sysfs_writer_apply(const SysfsWriter *w, const ActionParams *params,
-                        PowerMode mode);
-
 /* Force an immediate flush of all pending writes. */
 void sysfs_writer_flush(SysfsWriter *w);
 
 /* Queue a single raw write. Returns 0 on success. */
 int sysfs_writer_queue_raw(SysfsWriter *w, const char *path, const char *value);
+
+/* Write a value immediately and report the kernel write result. This is used
+ * for explicit user requests where success must not be acknowledged early. */
+int sysfs_writer_write_raw(SysfsWriter *w, const char *path, const char *value);
 
 /* Read current value of a sysfs path for dedup comparison.
  * Returns string in buf, or NULL on failure. Caller frees. */

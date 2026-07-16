@@ -5,7 +5,7 @@
 #include <stdbool.h>
 
 /* Maximum number of thermal zones we monitor */
-#define THERMAL_MAX_ZONES 16
+#define THERMAL_MAX_ZONES 64
 
 /* Maximum length of a thermal zone name */
 #define THERMAL_NAME_LEN 64
@@ -67,6 +67,19 @@ int thermal_manager_discover_zones(ThermalManager *tm);
 /* Read temperatures from all discovered zones.
  * Returns the current ThermalState. */
 ThermalState thermal_manager_update(ThermalManager *tm);
+
+/* Pure hysteresis helper used by the manager and unit tests. */
+ThermalState thermal_policy_next_state(const ThermalPolicy *policy,
+                                       ThermalState current,
+                                       int max_temp_millidegC);
+
+/* Require a candidate state to remain stable before applying it. Critical
+ * escalation is immediate; other transitions use time-based dwell periods. */
+ThermalState thermal_debounce_transition(ThermalState current,
+                                         ThermalState proposed,
+                                         ThermalState *pending,
+                                         int64_t *pending_since_ms,
+                                         int64_t now_ms);
 
 /* Get the number of discovered zones. */
 int thermal_manager_zone_count(const ThermalManager *tm);

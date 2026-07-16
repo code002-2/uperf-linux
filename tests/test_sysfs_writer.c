@@ -1,8 +1,10 @@
+#define _POSIX_C_SOURCE 200809L
 #include "../src/include/sysfs_writer.h"
 #include "../src/include/log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -161,9 +163,38 @@ TEST(test_reader_trims_newline) {
     }
 }
 
+TEST(test_immediate_and_full_batch_write) {
+    char path[] = "/tmp/uperf-sysfs-writer-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) { printf("FAIL (mkstemp)\n"); tests_failed++; return; }
+    close(fd);
+
+    Config cfg = {0};
+    SysfsWriter *w = sysfs_writer_new(&cfg, 1000000000ULL);
+    if (!w) { unlink(path); tests_failed++; return; }
+    if (sysfs_writer_write_raw(w, path, "A") != 0) {
+        printf("FAIL (immediate write)\n");
+        tests_failed++;
+        sysfs_writer_free(w);
+        unlink(path);
+        return;
+    }
+    for (int i = 0; i < SYSFS_BATCH_MAX + 1; i++)
+        sysfs_writer_queue_raw(w, path, i == SYSFS_BATCH_MAX ? "Z" : "B");
+    sysfs_writer_flush(w);
+    sysfs_writer_free(w);
+
+    char *value = sysfs_reader_read(path);
+    int ok = value && value[0] == 'Z';
+    free(value);
+    unlink(path);
+    if (!ok) { printf("FAIL (full batch flush)\n"); tests_failed++; return; }
+    ASSERT_PASS("immediate writes and full batches are flushed safely");
+}
+
 int main(void) {
     printf("=== sysfs_writer tests ===\n");
-    log_init(LOG_WARN, 0, NULL);
+    log_init(UPERF_LOG_WARN, 0, NULL);
 
     RUN_TEST(test_read_known_file);
     RUN_TEST(test_read_nonexistent);
@@ -175,6 +206,7 @@ int main(void) {
     RUN_TEST(test_queue_nonexistent_path);
     RUN_TEST(test_read_sysfs);
     RUN_TEST(test_reader_trims_newline);
+    RUN_TEST(test_immediate_and_full_batch_write);
 
     printf("\nResults: %d/%d passed (%d failed)\n",
            tests_passed, tests_run, tests_failed);

@@ -9,6 +9,8 @@
 typedef struct {
     int    efficiency;       /* Relative single-core performance score */
     int    nr_cores;         /* Number of cores in this cluster */
+    uint64_t cpu_mask;       /* Explicit CPUs belonging to this model */
+    char   cpumask_name[32]; /* Optional modules.sched.cpumask reference */
     float  typical_power_w;  /* Single-core power at typical_freq (Watts) */
     float  typical_freq_mhz; /* Normal operating frequency (MHz) */
     float  sweet_freq_mhz;   /* Most energy-efficient frequency (MHz) */
@@ -40,19 +42,20 @@ float power_model_select_freq(const PowerModelEntry *pm,
 /* Compute system-wide load from per-CPU utilization samples.
  * load_pct[]: per-CPU load percentage (0-100).
  * freq_mhz[]: per-CPU current frequency in MHz.
- * power_model: array of cluster entries (indexed by CPU).
+ * power_model: array of cluster entries.
  * nr_cpus: number of CPUs sampled.
+ * nr_clusters: number of entries in power_model.
  * Returns weighted load score. */
 float power_model_compute_system_load(const int *load_pct,
                                       const float *freq_mhz,
                                       const PowerModelEntry *power_model,
-                                      int nr_cpus);
+                                      int nr_cpus, int nr_clusters);
 
 /* Compute the total power budget for all clusters given current loads.
  * Returns total estimated system power in Watts. */
 float power_model_total_power(const int *load_pct,
                               const float *freq_mhz,
                               const PowerModelEntry *power_model,
-                              int nr_cpus);
+                              int nr_cpus, int nr_clusters);
 
 #endif /* UPERF_POWER_MODEL_H */
