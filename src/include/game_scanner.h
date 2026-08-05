@@ -2,6 +2,7 @@
 #define UPERF_GAME_SCANNER_H
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <sys/types.h>
 #include "config.h"
 
@@ -12,6 +13,7 @@
 /* Detected process entry */
 typedef struct {
     pid_t  pid;
+    uint64_t start_time;       /* /proc/[pid]/stat field 22 */
     char   comm[16];           /* /proc/[pid]/comm */
     char   cmdline[CMDLINE_MAX]; /* /proc/[pid]/cmdline (null-separated) */
     bool   is_game;            /* matched as a game process */
@@ -59,5 +61,9 @@ int game_scanner_perapp_scan(GameScanner *gs, const char *perapp_file);
 /* Get the assigned power mode for a detected game by comm name.
  * Returns MODE_BALANCE if no rule matches. */
 const char *game_scanner_get_app_mode(const GameScanner *gs, const char *comm);
+
+/* Persist and immediately apply an exact per-app mode assignment. */
+int game_scanner_set_app_mode(GameScanner *gs, const char *perapp_file,
+                              const char *comm, const char *mode);
 
 #endif /* UPERF_GAME_SCANNER_H */

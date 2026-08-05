@@ -10,11 +10,10 @@
 
 /* Trim leading/trailing whitespace in-place, return pointer to first non-space */
 static char *trim(char *s) {
-    while (*s == ' ' || *s == '\t' || *s == '\r') s++;
-    if (*s == '\0') return s;
-    char *end = s + strlen(s) - 1;
-    while (end > s && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n'))
-        *end-- = '\0';
+    while (*s != '\0' && isspace((unsigned char)*s)) s++;
+    char *end = s + strlen(s);
+    while (end > s && isspace((unsigned char)end[-1])) end--;
+    *end = '\0';
     return s;
 }
 
@@ -92,21 +91,35 @@ int perapp_load(PerAppConfig *cfg, const char *path) {
     return 0;
 }
 
-PowerMode perapp_lookup(const PerAppConfig *cfg, const char *comm) {
-    if (!cfg || !comm || cfg->nr_rules == 0)
-        return MODE_BALANCE;
+static bool pattern_matches(const char *pattern, const char *text) {
+    if (!pattern || !text || text[0] == '\0') return false;
+    if (strcmp(pattern, ".*") == 0 || strcmp(pattern, "*") == 0)
+        return true;
+    return strcasestr(text, pattern) != NULL;
+}
+
+bool perapp_lookup_process(const PerAppConfig *cfg, const char *comm,
+                           const char *cmdline, PowerMode *mode) {
+    if (!cfg || !mode || cfg->nr_rules == 0) return false;
 
     /* Check each rule — first match wins (more specific patterns should be listed first) */
     for (int i = 0; i < cfg->nr_rules; i++) {
-        if (strstr(comm, cfg->rules[i].pattern) ||
-            strstr(cfg->rules[i].pattern, comm)) {
-            log_debug("perapp: comm='%s' matched rule '%s' → mode %d",
-                      comm, cfg->rules[i].pattern, cfg->rules[i].mode);
-            return cfg->rules[i].mode;
+        if (pattern_matches(cfg->rules[i].pattern, comm) ||
+            pattern_matches(cfg->rules[i].pattern, cmdline)) {
+            *mode = cfg->rules[i].mode;
+            log_debug("perapp: process='%s' matched rule '%s' → mode %d",
+                      comm ? comm : "", cfg->rules[i].pattern, *mode);
+            return true;
         }
     }
 
-    return MODE_BALANCE;
+    return false;
+}
+
+PowerMode perapp_lookup(const PerAppConfig *cfg, const char *comm) {
+    PowerMode mode = MODE_BALANCE;
+    perapp_lookup_process(cfg, comm, NULL, &mode);
+    return mode;
 }
 
 PowerMode perapp_lookup_pid(const PerAppConfig *cfg, pid_t pid) {

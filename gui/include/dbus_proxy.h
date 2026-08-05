@@ -26,6 +26,15 @@ struct _DbusProxy {
     gint    *game_pid;
     gchar  **game_mode;
     int      nr_games;
+
+    /* Task scheduler / cgroup status */
+    gint     active_pid;
+    gint     tracked_processes;
+    gint     tracked_threads;
+    gint    *wl_pid;
+    gchar  **wl_comm;
+    gchar  **wl_class;
+    int      nr_workloads;
     GDBusConnection *bus;
     guint            poll_id;
     guint            stats_poll_id;
@@ -55,13 +64,7 @@ void  dbus_proxy_set_heavy_cb(DbusProxy *self, GCallback cb, gpointer ud);
 void  dbus_proxy_set_thermal_cb(DbusProxy *self, GCallback cb, gpointer ud);
 gboolean dbus_proxy_set_mode(DbusProxy *self, const gchar *mode);
 gboolean dbus_proxy_set_game_mode(DbusProxy *self, gint pid, const gchar *app, const gchar *mode);
-gboolean dbus_proxy_apply_settings(DbusProxy *self,
-    gdouble heavy_load_thd, gdouble idle_load_thd,
-    gdouble sample_time, gdouble burst_slack,
-    gdouble latency_time, gdouble margin, gdouble burst,
-    gdouble slow_limit, gdouble fast_limit, gdouble fast_limit_cap,
-    gdouble warn_temp, gdouble throttle_temp,
-    gdouble critical_temp, gdouble recovery_temp);
+gboolean dbus_proxy_reload_config(DbusProxy *self);
 gboolean dbus_proxy_apply_freq_override(DbusProxy *self,
     gint64 prime, gint64 perf, gint64 eff, gint64 gpu);
 gboolean dbus_proxy_release_freq_override(DbusProxy *self);

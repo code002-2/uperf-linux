@@ -28,5 +28,5 @@ target_compile_options(uperf-gui PRIVATE
     ${LIBADWAITA_CFLAGS_OTHER}
 )
 
-install(TARGETS uperf-gui DESTINATION /usr/local/bin)
+install(TARGETS uperf-gui DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES uperf-gui.desktop DESTINATION share/applications)

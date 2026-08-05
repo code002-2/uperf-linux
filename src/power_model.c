@@ -11,15 +11,15 @@
  *
  * Regions (frequency in MHz):
  *   [0 .. freeFreq]       : Below minimum efficient frequency
- *   [freeFreq .. sweet]   : Efficiency ramp-up (near-linear)
- *   [sweet .. plain]      : Sweet spot to linear boundary
- *   [plain .. max]        : Linear extrapolation beyond sweet spot
+ *   [freeFreq .. plain]   : Low-frequency efficiency ramp
+ *   [plain .. sweet]      : Normal operating region
+ *   [sweet .. typical]    : Steeper high-performance region
  * ---------------------------------------------------------------- */
 
 float power_model_est_power(const PowerModelEntry *pm, float freq_mhz) {
     if (freq_mhz <= 0) return 0.0f;
-    if (freq_mhz > pm->typical_freq_mhz * 1.5f)
-        freq_mhz = pm->typical_freq_mhz * 1.5f;  /* Cap to prevent overflow */
+    if (freq_mhz > pm->typical_freq_mhz)
+        freq_mhz = pm->typical_freq_mhz;
 
     /* Normalize frequency to [0, 1] range relative to typical_freq */
     float norm = freq_mhz / pm->typical_freq_mhz;
@@ -35,31 +35,30 @@ float power_model_est_power(const PowerModelEntry *pm, float freq_mhz) {
         power = free_power * (freq_mhz / pm->free_freq_mhz);
     }
 
-    /* Adjust for the sweet spot region */
-    if (freq_mhz >= pm->free_freq_mhz && freq_mhz <= pm->sweet_freq_mhz) {
-        /* Linear interpolation between free and sweet */
+    /* Low-frequency efficiency ramp. */
+    if (freq_mhz > pm->free_freq_mhz &&
+        freq_mhz <= pm->plain_freq_mhz) {
         float t = (freq_mhz - pm->free_freq_mhz) /
-                  (pm->sweet_freq_mhz - pm->free_freq_mhz);
+                  (pm->plain_freq_mhz - pm->free_freq_mhz);
         float free_p = pm->typical_power_w * 0.3f;
-        float sweet_p = pm->typical_power_w * 0.6f;
-        power = free_p + t * (sweet_p - free_p);
+        float plain_p = pm->typical_power_w * 0.5f;
+        power = free_p + t * (plain_p - free_p);
     }
 
-    /* Above sweet spot: power increases more steeply */
-    if (freq_mhz > pm->sweet_freq_mhz && freq_mhz <= pm->plain_freq_mhz) {
+    if (freq_mhz > pm->plain_freq_mhz &&
+        freq_mhz <= pm->sweet_freq_mhz) {
+        float t = (freq_mhz - pm->plain_freq_mhz) /
+                  (pm->sweet_freq_mhz - pm->plain_freq_mhz);
+        float plain_p = pm->typical_power_w * 0.5f;
+        float sweet_p = pm->typical_power_w * 0.7f;
+        power = plain_p + t * (sweet_p - plain_p);
+    }
+
+    if (freq_mhz > pm->sweet_freq_mhz) {
         float t = (freq_mhz - pm->sweet_freq_mhz) /
-                  (pm->plain_freq_mhz - pm->sweet_freq_mhz);
-        float sweet_p = pm->typical_power_w * 0.6f;
-        float plain_p = pm->typical_power_w;
-        power = sweet_p + t * (plain_p - sweet_p);
-    }
-
-    /* Beyond plain: linear extrapolation */
-    if (freq_mhz > pm->plain_freq_mhz) {
-        float plain_p = pm->typical_power_w;
-        float extra = (freq_mhz - pm->plain_freq_mhz) /
-                       pm->typical_freq_mhz * pm->typical_power_w * 0.5f;
-        power = plain_p + extra;
+                  (pm->typical_freq_mhz - pm->sweet_freq_mhz);
+        float sweet_p = pm->typical_power_w * 0.7f;
+        power = sweet_p + t * (pm->typical_power_w - sweet_p);
     }
 
     return power;
@@ -88,7 +87,7 @@ float power_model_select_freq(const PowerModelEntry *pm,
 
     /* Binary search over frequency range */
     float lo = pm->free_freq_mhz;
-    float hi = pm->typical_freq_mhz * 1.5f;  /* Allow slight over-clock headroom */
+    float hi = pm->typical_freq_mhz;
     float mid;
 
     for (int iter = 0; iter < 50; iter++) {
@@ -111,17 +110,17 @@ float power_model_select_freq(const PowerModelEntry *pm,
 float power_model_compute_system_load(const int *load_pct,
                                       const float *freq_mhz,
                                       const PowerModelEntry *power_model,
-                                      int nr_cpus) {
+                                      int nr_cpus, int nr_clusters) {
     /* system_load = Σ efficiency[i] × (load_pct[i]/100) × (freq_MHz[i]/1000)
      * This weights each CPU's contribution by its relative performance.
      *
-     * NOTE: In a full implementation, we'd have a cpu_to_cluster[] mapping
-     * from the sched.cpumask config. For now, we assume CPUs are laid out
-     * contiguously per cluster. */
+     * This legacy aggregate API expects CPUs to be grouped contiguously in
+     * the same order as power_model[].  Runtime policy control uses explicit
+     * cpufreq masks via frequency_controller instead. */
     float total = 0.0f;
     int cpu_idx = 0;
 
-    for (int c = 0; c < nr_cpus && power_model[c].nr_cores > 0; c++) {
+    for (int c = 0; c < nr_clusters && power_model[c].nr_cores > 0; c++) {
         int cores_in_cluster = power_model[c].nr_cores;
         for (int j = 0; j < cores_in_cluster && cpu_idx < nr_cpus; j++, cpu_idx++) {
             float load_frac = load_pct[cpu_idx] / 100.0f;
@@ -136,12 +135,12 @@ float power_model_compute_system_load(const int *load_pct,
 float power_model_total_power(const int *load_pct,
                               const float *freq_mhz,
                               const PowerModelEntry *power_model,
-                              int nr_cpus) {
+                              int nr_cpus, int nr_clusters) {
     /* Sum of per-cluster estimated power, weighted by load */
     float total = 0.0f;
     int cpu_idx = 0;
 
-    for (int c = 0; c < nr_cpus && power_model[c].nr_cores > 0; c++) {
+    for (int c = 0; c < nr_clusters && power_model[c].nr_cores > 0; c++) {
         int cores_in_cluster = power_model[c].nr_cores;
         for (int j = 0; j < cores_in_cluster && cpu_idx < nr_cpus; j++, cpu_idx++) {
             float load_frac = load_pct[cpu_idx] / 100.0f;

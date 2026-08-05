@@ -1,12 +1,11 @@
 [Unit]
 Description=Uperf-Linux Userspace Performance Scheduler
 Documentation=https://github.com/code002-2/uperf-linux
-After=multi-user.target
-Wants=network-online.target
+After=dbus.service
 
 [Service]
-Type=simple
-ExecStart=/usr/local/bin/uperf-linux --config /etc/uperf-linux/config.json --journald
+Type=dbus
+ExecStart=/usr/bin/uperf-linux --config /etc/uperf-linux/config.json
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
@@ -16,21 +15,24 @@ SyslogIdentifier=uperf-linux
 
 # Runtime directory for state files and DBus socket
 RuntimeDirectory=uperf-linux
-StateDirectory=uperf-linux
+RuntimeDirectoryPreserve=restart
 
 # Security hardening
-NoNewPrivileges=no
+NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/etc/uperf-linux /run/uperf-linux /var/log/uperf-linux
-ProtectHome=yes
+ReadWritePaths=/etc/uperf-linux /run/uperf-linux
+# ProtectHome=yes would also hide /run/user, where user-manager control
+# sockets live. Hide actual home directories explicitly while exposing the
+# runtime tree read-only.
+ProtectHome=no
+InaccessiblePaths=/home /root
+ReadOnlyPaths=/run/user
 
-# cgroup delegation (needed for cgroup v2 management)
-Delegate=yes
 Slice=system.slice
 
 # Required capabilities
-CapabilityBoundingSet=CAP_SYS_NICE CAP_SYS_RESOURCE CAP_DAC_OVERRIDE CAP_BLOCK_SUSPEND
-AmbientCapabilities=CAP_SYS_NICE CAP_SYS_RESOURCE CAP_DAC_OVERRIDE CAP_BLOCK_SUSPEND
+CapabilityBoundingSet=CAP_SYS_NICE CAP_SYS_RESOURCE CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_SYS_NICE CAP_SYS_RESOURCE CAP_DAC_OVERRIDE
 
 # DBus activation
 BusName=org.uperflinux.Daemon

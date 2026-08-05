@@ -30,6 +30,11 @@ int perapp_load(PerAppConfig *cfg, const char *path);
  * Returns MODE_BALANCE (default) if no rule matches. */
 PowerMode perapp_lookup(const PerAppConfig *cfg, const char *comm);
 
+/* Match one process using both its comm and executable command line while
+ * preserving first-rule-wins ordering. Returns true when a rule matched. */
+bool perapp_lookup_process(const PerAppConfig *cfg, const char *comm,
+                           const char *cmdline, PowerMode *mode);
+
 /* Look up the power mode for a given process by PID (reads /proc/[pid]/comm).
  * Returns MODE_BALANCE if comm cannot be read or no rule matches. */
 PowerMode perapp_lookup_pid(const PerAppConfig *cfg, pid_t pid);

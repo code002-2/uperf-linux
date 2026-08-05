@@ -43,6 +43,17 @@ typedef struct {
 /* Opaque input monitor handle */
 typedef struct InputMonitor InputMonitor;
 
+/* Pure helpers used by the event parser and unit tests.  gesture_delay_time
+ * is expressed in seconds, while elapsed_ms is in milliseconds. */
+float input_monitor_distance(int32_t x1, int32_t y1,
+                             int32_t x2, int32_t y2);
+EventType input_monitor_classify_release(
+    float distance_ratio, float swipe_thd,
+    int32_t start_x, int32_t start_y,
+    int screen_width, int screen_height,
+    float gesture_thd_x, float gesture_thd_y,
+    float elapsed_ms, float gesture_delay_time);
+
 /* Create a new input monitor.
  * swipe_thd, gesture_thd_x, gesture_thd_y, gesture_delay_time:
  *   thresholds from config (input module).

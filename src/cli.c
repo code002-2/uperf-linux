@@ -1,316 +1,292 @@
 #define _GNU_SOURCE
-#include "log.h"
 #include "config.h"
-#include "game_scanner.h"
 
+#include <gio/gio.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <getopt.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <dirent.h>
-#include <ctype.h>
-#include <errno.h>
 
-static const char *RUN_DIR = "/run/uperf-linux";
-static const char *CONFIG_DIR = "/etc/uperf-linux";
+#define DAEMON_BUS   "org.uperflinux.Daemon"
+#define DAEMON_PATH  "/org/uperflinux/Daemon"
+#define DAEMON_IFACE "org.uperflinux.Daemon"
+#define CONTROL_CALL_TIMEOUT_MS 120000
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s <command> [args]\n"
-        "\n"
+        "Usage: %s <command> [args]\n\n"
         "Commands:\n"
-        "  status              Show current scheduler status\n"
-        "  mode <name>         Set power mode (balance|powersave|performance)\n"
-        "  game-list           List detected game processes\n"
-        "  log-level <n>       Set log level (0=debug..4=fatal)\n"
-        "  detect              Scan hardware and print baseline JSON config\n"
-        "  calibrate           Run power model calibration (TODO)\n"
-        "  set-freq <cluster> <freq_hz>\n"
-        "                      Manually set CPU/GPU frequency\n"
-        "                      cluster: -1=GPU, 0=Prime, 1=Perf, 2=Eff\n"
-        "                      freq_hz: target in Hz (0 = release override)\n"
-        "  help                Show this help\n",
+        "  status                         Show daemon and scheduler status\n"
+        "  mode <name>                    Set balance|powersave|performance\n"
+        "  game-list                      List detected game processes\n"
+        "  active-pid <pid|0>             Select/clear the active workload\n"
+        "  set-freq <cluster> <freq_hz>   Set/release a manual override\n"
+        "      cluster: -1=GPU, 0=Prime, 1=Perf, 2=Eff, 3=all CPUs\n"
+        "      freq_hz: 0 releases the override\n"
+        "  show-freqs                     Show frequencies reported by daemon\n"
+        "  detect                         Run the hardware config wizard\n"
+        "  help                           Show this help\n",
         prog);
 }
 
-static int cmd_status(void) {
-    char mode_path[MAX_PATH_LEN];
-    snprintf(mode_path, sizeof(mode_path), "%s/cur_powermode", RUN_DIR);
+static GDBusConnection *connect_daemon(void) {
+    GError *error = NULL;
+    GDBusConnection *connection = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL,
+                                                  &error);
+    if (!connection) {
+        fprintf(stderr, "Cannot connect to system D-Bus: %s\n",
+                error ? error->message : "unknown error");
+        g_clear_error(&error);
+    }
+    return connection;
+}
 
-    FILE *fp = fopen(mode_path, "r");
-    if (fp) {
-        char mode[32];
-        if (fgets(mode, sizeof(mode), fp)) {
-            mode[strcspn(mode, "\n")] = '\0';
-            printf("Power mode: %s\n", mode);
-        }
-        fclose(fp);
+static GVariant *daemon_call(GDBusConnection *connection,
+                             const char *method,
+                             GVariant *parameters,
+                             const GVariantType *reply_type) {
+    GError *error = NULL;
+    GVariant *reply = g_dbus_connection_call_sync(
+        connection, DAEMON_BUS, DAEMON_PATH, DAEMON_IFACE, method,
+        parameters, reply_type, G_DBUS_CALL_FLAGS_NONE,
+        CONTROL_CALL_TIMEOUT_MS, NULL, &error);
+    if (!reply) {
+        fprintf(stderr, "Daemon call %s failed: %s\n", method,
+                error ? error->message : "unknown error");
+        g_clear_error(&error);
+    }
+    return reply;
+}
+
+static GVariant *get_all_properties(GDBusConnection *connection) {
+    GError *error = NULL;
+    GVariant *reply = g_dbus_connection_call_sync(
+        connection, DAEMON_BUS, DAEMON_PATH,
+        "org.freedesktop.DBus.Properties", "GetAll",
+        g_variant_new("(s)", DAEMON_IFACE), G_VARIANT_TYPE("(a{sv})"),
+        G_DBUS_CALL_FLAGS_NONE, 5000, NULL, &error);
+    if (!reply) {
+        fprintf(stderr, "uperf-linux daemon is unavailable: %s\n",
+                error ? error->message : "unknown error");
+        g_clear_error(&error);
+        return NULL;
+    }
+    GVariant *properties = NULL;
+    g_variant_get(reply, "(@a{sv})", &properties);
+    g_variant_unref(reply);
+    return properties;
+}
+
+static void print_frequencies(GVariant *properties) {
+    GVariant *frequencies = g_variant_lookup_value(
+        properties, "CpuFrequencies", G_VARIANT_TYPE("ad"));
+    printf("CPU frequencies:\n");
+    if (!frequencies || g_variant_n_children(frequencies) == 0) {
+        printf("  (no samples yet)\n");
     } else {
-        printf("Power mode: (not set -- using default)\n");
+        gsize count = 0;
+        const gdouble *values = g_variant_get_fixed_array(
+            frequencies, &count, sizeof(*values));
+        for (gsize i = 0; i < count; i++)
+            printf("  CPU%zu: %.0f MHz\n", i, values[i]);
     }
+    if (frequencies) g_variant_unref(frequencies);
+}
 
-    printf("\nCPU frequencies:\n");
-    for (int cpu = 0; cpu < 8; cpu++) {
-        char path[MAX_PATH_LEN];
-        snprintf(path, sizeof(path),
-                 "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", cpu);
-        FILE *f = fopen(path, "r");
-        if (f) {
-            int freq;
-            if (fscanf(f, "%d", &freq) == 1)
-                printf("  cpu%d: %d kHz (%.2f MHz)\n", cpu, freq, freq / 1000.0);
-            fclose(f);
-        }
-    }
+static int cmd_status(void) {
+    GDBusConnection *connection = connect_daemon();
+    if (!connection) return 1;
+    GVariant *properties = get_all_properties(connection);
+    g_object_unref(connection);
+    if (!properties) return 1;
 
-    printf("\nKnown game processes:\n");
-    DIR *proc = opendir("/proc");
-    if (proc) {
-        struct dirent *ent;
-        int count = 0;
-        while ((ent = readdir(proc)) && count < 16) {
-            if (!isdigit((unsigned char)ent->d_name[0])) continue;
-            char comm_path[MAX_PATH_LEN];
-            snprintf(comm_path, sizeof(comm_path), "/proc/%s/comm", ent->d_name);
-            FILE *cf = fopen(comm_path, "r");
-            if (cf) {
-                char comm[64];
-                if (fgets(comm, sizeof(comm), cf)) {
-                    comm[strcspn(comm, "\n")] = '\0';
-                    if (strlen(comm) > 4) {
-                        printf("  PID %s: %s\n", ent->d_name, comm);
-                        count++;
-                    }
-                }
-                fclose(cf);
-            }
-        }
-        if (count == 0)
-            printf("  (none detected)\n");
-        closedir(proc);
-    }
+    const char *mode = "unknown";
+    const char *scene = "unknown";
+    gboolean heavy = FALSE;
+    gint32 temperature = 0;
+    gint32 active_pid = 0;
+    g_variant_lookup(properties, "CurrentMode", "&s", &mode);
+    g_variant_lookup(properties, "CurrentScene", "&s", &scene);
+    g_variant_lookup(properties, "IsHeavyLoad", "b", &heavy);
+    g_variant_lookup(properties, "MaxTemperature", "i", &temperature);
+    g_variant_lookup(properties, "ActiveProcess", "i", &active_pid);
+    printf("Power mode: %s\nScene: %s\nHeavy load: %s\nActive PID: %d\n",
+           mode, scene, heavy ? "yes" : "no", active_pid);
+    if (temperature > 0)
+        printf("Max temperature: %.1f C\n", temperature / 1000.0);
+    printf("\n");
+    print_frequencies(properties);
 
+    GVariant *games = g_variant_lookup_value(
+        properties, "GameProcesses", G_VARIANT_TYPE("a(issss)"));
+    printf("\nDetected game processes: %zu\n",
+           games ? g_variant_n_children(games) : 0);
+    if (games) g_variant_unref(games);
+    g_variant_unref(properties);
     return 0;
 }
 
-static int cmd_mode(const char *mode_name) {
-    struct stat st;
-    if (stat(RUN_DIR, &st) != 0) {
-        mkdir(RUN_DIR, 0755);
-    }
-
-    char path[MAX_PATH_LEN];
-    snprintf(path, sizeof(path), "%s/cur_powermode", RUN_DIR);
-
-    FILE *fp = fopen(path, "w");
-    if (!fp) {
-        fprintf(stderr, "Error: cannot write to %s: %s\n", path, strerror(errno));
-        fprintf(stderr, "Hint: run as root, or create %s with proper permissions\n", RUN_DIR);
+static int cmd_mode(const char *mode) {
+    if (strcmp(mode, "balance") != 0 && strcmp(mode, "powersave") != 0 &&
+        strcmp(mode, "performance") != 0) {
+        fprintf(stderr, "Invalid mode: %s\n", mode);
         return 1;
     }
-
-    fprintf(fp, "%s\n", mode_name);
-    fclose(fp);
-
-    printf("Power mode set to: %s\n", mode_name);
+    GDBusConnection *connection = connect_daemon();
+    if (!connection) return 1;
+    GVariant *reply = daemon_call(connection, "SetMode",
+                                  g_variant_new("(s)", mode),
+                                  G_VARIANT_TYPE("(b)"));
+    g_object_unref(connection);
+    if (!reply) return 1;
+    gboolean success = FALSE;
+    g_variant_get(reply, "(b)", &success);
+    g_variant_unref(reply);
+    if (!success) {
+        fprintf(stderr, "Daemon rejected mode '%s'\n", mode);
+        return 1;
+    }
+    printf("Power mode set to: %s\n", mode);
     return 0;
 }
 
 static int cmd_game_list(void) {
-    printf("Scanning for game processes...\n\n");
+    GDBusConnection *connection = connect_daemon();
+    if (!connection) return 1;
+    GVariant *properties = get_all_properties(connection);
+    g_object_unref(connection);
+    if (!properties) return 1;
+    GVariant *games = g_variant_lookup_value(
+        properties, "GameProcesses", G_VARIANT_TYPE("a(issss)"));
+    g_variant_unref(properties);
+    if (!games) return 1;
 
-    DIR *proc = opendir("/proc");
-    if (!proc) {
-        perror("opendir /proc");
-        return 1;
+    gsize count = g_variant_n_children(games);
+    for (gsize i = 0; i < count; i++) {
+        gint pid;
+        const gchar *comm, *cmdline, *package, *mode;
+        g_variant_get_child(games, i, "(i&s&s&s&s)", &pid, &comm,
+                            &cmdline, &package, &mode);
+        (void)cmdline;
+        (void)package;
+        printf("  PID %-6d %-16s %s\n", pid, comm, mode);
     }
-
-    struct dirent *ent;
-    int count = 0;
-    while ((ent = readdir(proc)) && count < MAX_GAMES) {
-        if (!isdigit((unsigned char)ent->d_name[0])) continue;
-
-        pid_t pid = atoi(ent->d_name);
-        if (pid < 2) continue;
-
-        char comm_path[MAX_PATH_LEN];
-        char comm[64];
-        snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
-        FILE *fp = fopen(comm_path, "r");
-        if (!fp) continue;
-        fgets(comm, sizeof(comm), fp);
-        comm[strcspn(comm, "\n")] = '\0';
-        fclose(fp);
-
-        char cmdline[512] = {0};
-        snprintf(comm_path, sizeof(comm_path), "/proc/%d/cmdline", pid);
-        fp = fopen(comm_path, "r");
-        if (fp) {
-            size_t n = fread(cmdline, 1, sizeof(cmdline) - 1, fp);
-            for (size_t i = 0; i < n; i++)
-                if (cmdline[i] == '\0') cmdline[i] = ' ';
-            fclose(fp);
-        }
-
-        if (game_scanner_match(comm, cmdline)) {
-            printf("  [%d] PID %-6d  %-16s  %s\n",
-                   ++count, pid, comm, cmdline);
-        }
-    }
-    closedir(proc);
-
-    if (count == 0)
-        printf("  (no game processes detected)\n");
-
-    printf("\nTotal: %d game process(es)\n", count);
+    if (count == 0) printf("  (no game processes detected)\n");
+    printf("Total: %zu game process(es)\n", count);
+    g_variant_unref(games);
     return 0;
 }
 
-int main(int argc, char *argv[]) {
+static int cmd_set_freq(const char *cluster_text, const char *freq_text) {
+    char *end = NULL;
+    errno = 0;
+    long cluster = strtol(cluster_text, &end, 10);
+    if (errno || end == cluster_text || *end || cluster < -1 || cluster > 3) {
+        fprintf(stderr, "Invalid cluster: %s\n", cluster_text);
+        return 1;
+    }
+    end = NULL;
+    errno = 0;
+    gint64 frequency = g_ascii_strtoll(freq_text, &end, 10);
+    if (errno || end == freq_text || *end || frequency < 0) {
+        fprintf(stderr, "Invalid frequency: %s\n", freq_text);
+        return 1;
+    }
+
+    GDBusConnection *connection = connect_daemon();
+    if (!connection) return 1;
+    GVariant *reply = daemon_call(connection, "SetManualFreq",
+                                  g_variant_new("(ix)", (gint)cluster,
+                                                frequency),
+                                  G_VARIANT_TYPE("(b)"));
+    g_object_unref(connection);
+    if (!reply) return 1;
+    gboolean success = FALSE;
+    g_variant_get(reply, "(b)", &success);
+    g_variant_unref(reply);
+    if (!success) {
+        fprintf(stderr, "Daemon rejected the frequency (check hardware range and permissions)\n");
+        return 1;
+    }
+    printf("Manual override %s for cluster %ld\n",
+           frequency == 0 ? "released" : "applied", cluster);
+    return 0;
+}
+
+static int cmd_active_pid(const char *pid_text) {
+    char *end = NULL;
+    errno = 0;
+    long pid = strtol(pid_text, &end, 10);
+    if (errno || end == pid_text || *end || pid < 0 || pid > G_MAXINT32) {
+        fprintf(stderr, "Invalid PID: %s\n", pid_text);
+        return 1;
+    }
+    GDBusConnection *connection = connect_daemon();
+    if (!connection) return 1;
+    GVariant *reply = daemon_call(connection, "SetActiveProcess",
+                                  g_variant_new("(i)", (gint)pid),
+                                  G_VARIANT_TYPE("(b)"));
+    g_object_unref(connection);
+    if (!reply) return 1;
+    gboolean success = FALSE;
+    g_variant_get(reply, "(b)", &success);
+    g_variant_unref(reply);
+    if (!success) {
+        fprintf(stderr, "Daemon rejected active PID %ld\n", pid);
+        return 1;
+    }
+    if (pid == 0)
+        printf("Active workload selection cleared\n");
+    else
+        printf("Active workload set to PID %ld\n", pid);
+    return 0;
+}
+
+static int cmd_show_freqs(void) {
+    GDBusConnection *connection = connect_daemon();
+    if (!connection) return 1;
+    GVariant *properties = get_all_properties(connection);
+    g_object_unref(connection);
+    if (!properties) return 1;
+    print_frequencies(properties);
+    g_variant_unref(properties);
+    return 0;
+}
+
+int main(int argc, char **argv) {
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;
     }
-
-    const char *cmd = argv[1];
-
-    if (strcmp(cmd, "help") == 0 || strcmp(cmd, "--help") == 0) {
+    const char *command = argv[1];
+    if (strcmp(command, "help") == 0 || strcmp(command, "--help") == 0) {
         print_usage(argv[0]);
         return 0;
     }
-
-    if (strcmp(cmd, "version") == 0 || strcmp(cmd, "--version") == 0) {
-        printf("uperfctl v0.1.0\n");
+    if (strcmp(command, "version") == 0 || strcmp(command, "--version") == 0) {
+        puts("uperfctl v0.1.0");
         return 0;
     }
-
-    if (strcmp(cmd, "status") == 0) {
-        return cmd_status();
-    }
-
-    if (strcmp(cmd, "mode") == 0) {
-        if (argc < 3) {
-            fprintf(stderr, "Error: mode requires an argument\n");
-            fprintf(stderr, "Usage: %s mode <balance|powersave|performance>\n", argv[0]);
-            return 1;
-        }
-        return cmd_mode(argv[2]);
-    }
-
-    if (strcmp(cmd, "game-list") == 0) {
-        return cmd_game_list();
-    }
-
-    if (strcmp(cmd, "detect") == 0) {
-        static const char *wizard_path = "/usr/local/bin/uperf-wizard";
-        char cmd_buf[512];
-        snprintf(cmd_buf, sizeof(cmd_buf), "exec %s detect 2>&1", wizard_path);
-        int ret = system(cmd_buf);
-        return ret >> 8;
-    }
-
-    if (strcmp(cmd, "calibrate") == 0) {
-        fprintf(stderr, "Calibration not yet implemented. Use uperf-wizard calibrate.\n");
+    if (strcmp(command, "status") == 0) return cmd_status();
+    if (strcmp(command, "game-list") == 0) return cmd_game_list();
+    if (strcmp(command, "show-freqs") == 0) return cmd_show_freqs();
+    if (strcmp(command, "mode") == 0)
+        return argc == 3 ? cmd_mode(argv[2]) : (print_usage(argv[0]), 1);
+    if (strcmp(command, "set-freq") == 0)
+        return argc == 4 ? cmd_set_freq(argv[2], argv[3])
+                         : (print_usage(argv[0]), 1);
+    if (strcmp(command, "active-pid") == 0)
+        return argc == 3 ? cmd_active_pid(argv[2])
+                         : (print_usage(argv[0]), 1);
+    if (strcmp(command, "detect") == 0) {
+        execl("/usr/bin/uperf-wizard", "uperf-wizard", "detect",
+              (char *)NULL);
+        execlp("uperf-wizard", "uperf-wizard", "detect", (char *)NULL);
+        fprintf(stderr, "Cannot run uperf-wizard: %s\n", strerror(errno));
         return 1;
     }
-
-    if (strcmp(cmd, "set-freq") == 0) {
-        if (argc < 4) {
-            fprintf(stderr, "Error: set-freq requires <cluster> and <freq_hz>\n");
-            fprintf(stderr, "Usage: %s set-freq <cluster> <freq_hz>\n", argv[0]);
-            fprintf(stderr, "  cluster: -1=GPU, 0=Prime, 1=Perf, 2=Eff\n");
-            fprintf(stderr, "  freq_hz: target frequency in Hz (0 = release override)\n");
-            return 1;
-        }
-        int cluster = atoi(argv[2]);
-        long long freq_hz = atoll(argv[3]);
-        if (cluster < -1 || cluster > 2) {
-            fprintf(stderr, "Error: invalid cluster %d (must be -1..2)\n", cluster);
-            return 1;
-        }
-        if (freq_hz < 0) {
-            fprintf(stderr, "Error: frequency must be >= 0\n");
-            return 1;
-        }
-
-        char path[MAX_PATH_LEN];
-        char value[32];
-        snprintf(value, sizeof(value), "%lld", freq_hz);
-
-        FILE *fp = NULL;
-        int found = 0;
-
-        if (cluster == -1) {
-            /* GPU: try common devfreq paths */
-            const char *gpu_paths[] = {
-                "/sys/class/devfreq/soc:qcom:gpu/max_freq",
-                "/sys/class/devfreq/soc\:qcom\:gpu/max_freq",
-                NULL
-            };
-            for (int p = 0; gpu_paths[p]; p++) {
-                snprintf(path, sizeof(path), "%s", gpu_paths[p]);
-                fp = fopen(path, "w");
-                if (fp) { found = 1; break; }
-            }
-            if (!found) {
-                fprintf(stderr, "Error: GPU devfreq node not found\n");
-                return 1;
-            }
-        } else {
-            snprintf(path, sizeof(path),
-                     "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq",
-                     cluster);
-            fp = fopen(path, "w");
-        }
-
-        if (!fp) {
-            fprintf(stderr, "Error: cannot write to %s: %s\n", path, strerror(errno));
-            fprintf(stderr, "Hint: run as root\n");
-            return 1;
-        }
-        fprintf(fp, "%s", value);
-        fclose(fp);
-
-        printf("Manual frequency set: cluster=%s(%d) = %s Hz\n",
-               cluster == -1 ? "GPU" : "CPU", cluster, value);
-        return 0;
-    }
-
-    if (strcmp(cmd, "show-freqs") == 0) {
-        printf("Current CPU frequencies:\n");
-        for (int cpu = 0; cpu < 8; cpu++) {
-            char path[MAX_PATH_LEN];
-            snprintf(path, sizeof(path),
-                     "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", cpu);
-            FILE *f = fopen(path, "r");
-            if (f) {
-                long long freq;
-                if (fscanf(f, "%lld", &freq) == 1)
-                    printf("  cpu%d: %lld Hz (%.2f MHz)\n", cpu, freq, freq / 1e6);
-                fclose(f);
-            }
-        }
-
-        printf("\nGPU frequency:\n");
-        char gpu_path[MAX_PATH_LEN];
-        snprintf(gpu_path, sizeof(gpu_path),
-                 "/sys/class/devfreq/soc:qcom:gpu/cur_freq");
-        FILE *f = fopen(gpu_path, "r");
-        if (f) {
-            long long freq;
-            if (fscanf(f, "%lld", &freq) == 1)
-                printf("  GPU: %lld Hz (%.2f MHz)\n", freq, freq / 1e6);
-            fclose(f);
-        } else {
-            printf("  GPU: (cannot read -- devfreq node not found)\n");
-        }
-        return 0;
-    }
-
-    fprintf(stderr, "Unknown command: %s\n", cmd);
+    fprintf(stderr, "Unknown command: %s\n", command);
     print_usage(argv[0]);
     return 1;
 }

@@ -186,7 +186,7 @@ TEST(test_system_load_computation) {
     PowerModelEntry pm[1] = { make_pm(280, 2, 1.5f, 2200, 1600, 1200, 500) };
     int loads[2] = {50, 50};
     float freqs[2] = {2200, 2200};
-    float load = power_model_compute_system_load(loads, freqs, pm, 2);
+    float load = power_model_compute_system_load(loads, freqs, pm, 2, 1);
     ASSERT_GT(load, 0.0f, "positive load");
     ASSERT_PASS("system load computed from per-CPU samples");
 }
@@ -195,7 +195,7 @@ TEST(test_system_load_zero) {
     PowerModelEntry pm[1] = { make_pm(280, 2, 1.5f, 2200, 1600, 1200, 500) };
     int loads[2] = {0, 0};
     float freqs[2] = {1000, 1000};
-    float load = power_model_compute_system_load(loads, freqs, pm, 2);
+    float load = power_model_compute_system_load(loads, freqs, pm, 2, 1);
     ASSERT_NEAR(load, 0.0f, 1.0f, "zero load at zero utilization");
     ASSERT_PASS("system load is zero when all CPUs idle");
 }
@@ -204,7 +204,7 @@ TEST(test_system_load_max) {
     PowerModelEntry pm[1] = { make_pm(280, 2, 1.5f, 2200, 1600, 1200, 500) };
     int loads[2] = {100, 100};
     float freqs[2] = {2200, 2200};
-    float load = power_model_compute_system_load(loads, freqs, pm, 2);
+    float load = power_model_compute_system_load(loads, freqs, pm, 2, 1);
     /* Expected: 280 * 1.0 * 2.2 = 616 */
     ASSERT_GT(load, 500.0f, "high load at max utilization");
     ASSERT_PASS("system load is high at full utilization");
@@ -217,7 +217,7 @@ TEST(test_system_load_different_clusters) {
     };
     int loads[2] = {100, 100};
     float freqs[2] = {2400, 1600};
-    float load = power_model_compute_system_load(loads, freqs, pm, 2);
+    float load = power_model_compute_system_load(loads, freqs, pm, 2, 2);
     /* Prime contributes: 350 * 1.0 * 2.4 = 840 */
     /* Eff contributes: 180 * 1.0 * 1.6 = 288 */
     /* Total: ~1128 */
@@ -231,7 +231,7 @@ TEST(total_power_at_zero_load) {
     PowerModelEntry pm[1] = { make_pm(280, 2, 1.5f, 2200, 1600, 1200, 500) };
     int loads[2] = {0, 0};
     float freqs[2] = {1000, 1000};
-    float total = power_model_total_power(loads, freqs, pm, 2);
+    float total = power_model_total_power(loads, freqs, pm, 2, 1);
     ASSERT_LT(total, 1.0f, "low power at zero load");
     ASSERT_PASS("total power near-zero at zero load");
 }
@@ -241,8 +241,8 @@ TEST(total_power_increases_with_load) {
     int loads_low[2] = {10, 10};
     int loads_high[2] = {90, 90};
     float freqs[2] = {2000, 2000};
-    float p_low = power_model_total_power(loads_low, freqs, pm, 2);
-    float p_high = power_model_total_power(loads_high, freqs, pm, 2);
+    float p_low = power_model_total_power(loads_low, freqs, pm, 2, 1);
+    float p_high = power_model_total_power(loads_high, freqs, pm, 2, 1);
     ASSERT_GT(p_high, p_low, "high load → more power");
     ASSERT_PASS("total power increases with load");
 }
@@ -252,15 +252,15 @@ TEST(total_power_with_different_frequencies) {
     int loads[2] = {50, 50};
     float freqs_low[2] = {600, 600};
     float freqs_high[2] = {2000, 2000};
-    float p_low = power_model_total_power(loads, freqs_low, pm, 2);
-    float p_high = power_model_total_power(loads, freqs_high, pm, 2);
+    float p_low = power_model_total_power(loads, freqs_low, pm, 2, 1);
+    float p_high = power_model_total_power(loads, freqs_high, pm, 2, 1);
     ASSERT_GT(p_high, p_low, "high freq → more power");
     ASSERT_PASS("total power increases with frequency");
 }
 
 int main(void) {
     printf("=== power_model tests ===\n");
-    log_init(LOG_WARN, 0, NULL);
+    log_init(UPERF_LOG_WARN, 0, NULL);
 
     RUN_TEST(test_zero_freq_zero_power);
     RUN_TEST(test_power_increases_with_freq);

@@ -9,6 +9,10 @@
 #define DBUS_MAX_CLUSTERS  8
 #define DBUS_MAX_CPUS      16
 
+/* Polkit actions used to authorize state-changing D-Bus methods. */
+#define DBUS_ACTION_CONTROL "org.uperflinux.control"
+#define DBUS_ACTION_ADMIN   "org.uperflinux.admin"
+
 /* Opaque DBus manager handle */
 typedef struct DbusManager DbusManager;
 
@@ -19,6 +23,21 @@ DbusManager *dbus_manager_new(GType bus_type);
 
 /* Free DBus manager and unregister from bus. */
 void dbus_manager_free(DbusManager *mgr);
+
+/* Override the default Polkit authorization check. This is primarily useful
+ * for tests and embedded session-bus users. A NULL callback restores the
+ * default behavior (Polkit on the system bus, allow on a session bus).
+ *
+ * The callback runs before a method is dispatched. Returning FALSE rejects
+ * the call with org.freedesktop.DBus.Error.AccessDenied. */
+typedef gboolean (*DbusAuthorizeFunc)(const char *sender,
+                                      const char *action_id,
+                                      gboolean allow_user_interaction,
+                                      GError **error,
+                                      void *user_data);
+void dbus_manager_set_authorize_handler(DbusManager *mgr,
+                                        DbusAuthorizeFunc callback,
+                                        void *user_data);
 
 /* Update current power mode. Triggers ModeChanged signal.
  * mode: "balance", "powersave", or "performance" */
@@ -60,6 +79,23 @@ void dbus_manager_update_games(DbusManager *mgr,
                                 const GameProcessEntry *processes,
                                 int nr);
 
+/* One managed process, for the ManagedWorkloads property. */
+typedef struct {
+    gint32 pid;
+    char   comm[64];
+    char   cgroup_class[64];
+} DbusWorkloadEntry;
+
+/* Publish task-scheduler status: tracked counts and the per-process cgroup
+ * class assignments currently in effect. */
+void dbus_manager_update_scheduler(DbusManager *mgr,
+                                   int tracked_processes, int tracked_threads,
+                                   const DbusWorkloadEntry *workloads, int nr);
+
+/* Borrow the current in-memory game list for diagnostics/tests. The returned
+ * pointer remains owned by the manager and is invalidated by the next update. */
+const GameProcessEntry *dbus_manager_get_games(const DbusManager *mgr, int *nr);
+
 /* Get the current mode string (for DBus property getter). */
 const char *dbus_manager_get_mode(const DbusManager *mgr);
 
@@ -82,6 +118,30 @@ typedef void (*DbusSetModeFunc)(const char *mode, void *user_data);
 void dbus_manager_set_mode_handler(DbusManager *mgr,
                                     DbusSetModeFunc callback,
                                     void *user_data);
+
+typedef gboolean (*DbusReloadConfigFunc)(void *user_data);
+void dbus_manager_set_reload_handler(DbusManager *mgr,
+                                     DbusReloadConfigFunc callback,
+                                     void *user_data);
+
+typedef gboolean (*DbusSetGameModeFunc)(pid_t pid, const char *app_name,
+                                        const char *mode, void *user_data);
+void dbus_manager_set_game_mode_handler(DbusManager *mgr,
+                                         DbusSetGameModeFunc callback,
+                                         void *user_data);
+
+typedef gboolean (*DbusSetManualFreqFunc)(int cluster, gint64 freq_hz,
+                                           void *user_data);
+void dbus_manager_set_manual_freq_handler(DbusManager *mgr,
+                                           DbusSetManualFreqFunc callback,
+                                           void *user_data);
+
+typedef gboolean (*DbusSetActivePidFunc)(pid_t pid, void *user_data);
+void dbus_manager_set_active_pid_handler(DbusManager *mgr,
+                                         DbusSetActivePidFunc callback,
+                                         void *user_data);
+void dbus_manager_set_active_pid(DbusManager *mgr, pid_t pid);
+pid_t dbus_manager_get_active_pid(const DbusManager *mgr);
 
 /* Update thermal state information. */
 void dbus_manager_set_thermal_state(DbusManager *mgr, int max_temp_millidegC,

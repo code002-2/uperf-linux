@@ -6,34 +6,33 @@
 
 ## Overview
 
-`uperf-linux` is a systemd-managed daemon with a GTK4/libadwaita GUI that provides fine-grained CPU/GPU scheduling
+`uperf-linux` is a systemd-managed daemon with a GTK4/libadwaita GUI that provides CPU/GPU frequency control
 for gaming on Linux ARM64 devices. It uses a JSON-driven configuration approach with scene-based state machines,
 touch-aware pacing, and power model optimization.
 
-- **JSON-config-driven** sysfs knob writing (cpufreq, devfreq, uClamp)
+- **JSON-config-driven** cpufreq policy control with validated hardware limits
 - **Scene-based state machine** (idle → touch → trigger → gesture → junk → switch → boost)
 - **Touch-aware pacing** — reacts to swipe/gesture events from the touchscreen
 - **Power model** — finds the "sweet spot" on the P-F curve for each cluster
 - **HeavyLoad detection** — automatic boost mode when sustained load exceeds threshold
-- **Task affinity management** — pins game threads to performance cores via cgroup v2
+- **Per-app modes** — applies configured power modes when matching games start and stop
 
 ## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                    systemd (PID 1)                           │
-│  uperf-linux.service  (After=multi-user.target)              │
+│  uperf-linux.service  (Type=dbus, system bus)                │
 └──────────────────────────┬───────────────────────────────────┘
                            │
                            ▼
 ┌──────────────────────────────────────────────────────────────┐
-│                    uperf-linux daemon (root)                  │
+│                    uperf-linux daemon (root)                 │
 │                                                              │
-│  ConfigParser ←→ JSON config (hot-reload via inotify)        │
+│  ConfigParser ←→ JSON config (SIGHUP/DBus reload)            │
 │  InputMonitor ←→ /dev/input/event* (evdev, epoll)            │
-│  StateEngine  ←→ FSM with timers (timerfd)                   │
-│  SysfsWriter  ←→ batched/deduped writes to sysfs             │
-│  CgroupMgr    ←→ cgroup v2 slices + uClamp                   │
+│  StateEngine  ←→ FSM with monotonic timeouts                 │
+│  FreqControl  ←→ cpufreq policies + power model              │
 │  HeavyLoad    ←→ /proc/stat polling                          │
 │  GameScanner  ←→ /proc/*/comm + /proc/*/cmdline matching     │
 │  DBusManager  ←→ org.uperflinux.Daemon (system bus)          │
@@ -52,8 +51,8 @@ uperf-gui
 ### Features
 - **Dashboard**: Power mode buttons, real-time CPU frequency display, load meters, scene indicator
 - **Games**: Detected game process list with per-app mode assignment
-- **Settings**: Threshold inputs (HeavyLoad, sample time, margin, burst, power budgets, thermal)
-- **Logs**: Live daemon log viewer
+- **Configuration**: Reload `/etc/uperf-linux/config.json` without restarting the daemon
+- **Logs**: Latest 200 service journal entries
 - **Frequency Override**: Manual CPU/GPU frequency locking
 
 ### DBus Interface
@@ -105,8 +104,8 @@ make -j$(nproc)
 
 ```bash
 # As root
-sudo cp uperf-linux /usr/local/bin/
-sudo cp uperfctl /usr/local/bin/
+sudo cp uperf-linux /usr/bin/
+sudo cp uperfctl /usr/bin/
 sudo mkdir -p /etc/uperf-linux
 sudo cp ../config/sm8550.json /etc/uperf-linux/config.json
 sudo cp ../config/perapp_powermode /etc/uperf-linux/
@@ -116,7 +115,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now uperf-linux.service
 
 # GUI
-sudo cp uperf-gui /usr/local/bin/
+sudo cp uperf-gui /usr/bin/
 sudo desktop-file-install gui/uperf-gui.desktop
 ```
 
@@ -131,15 +130,15 @@ sudo systemctl enable --now uperf-linux
 
 ```bash
 # Check status
-sudo uperfctl status
+uperfctl status
 
 # Switch power mode
-sudo uperfctl mode performance    # Full throttle
-sudo uperfctl mode balance        # Balanced (default)
-sudo uperfctl mode powersave      # Battery saving
+uperfctl mode performance    # Full throttle
+uperfctl mode balance        # Balanced (default)
+uperfctl mode powersave      # Battery saving
 
 # List detected game processes
-sudo uperfctl game-list
+uperfctl game-list
 
 # View logs
 journalctl -u uperf-linux -f
@@ -158,6 +157,7 @@ Defines per-cluster performance characteristics:
   {
     "efficiency": 350,        /* Relative IPC score (Cortex-A53@1GHz = 100) */
     "nr": 1,                  /* Number of cores in this cluster */
+    "cpus": [7],              /* Exact CPUs in this cpufreq policy */
     "typicalPower": 1.2,      /* Single-core power at typicalFreq (W) */
     "typicalFreq": 2400,      /* Normal operating frequency (MHz) */
     "sweetFreq": 1800,        /* Most energy-efficient frequency (MHz) */
@@ -166,6 +166,12 @@ Defines per-cluster performance characteristics:
   }
 ]
 ```
+
+Each enabled CPU model must identify its policy explicitly. Use a direct
+`"cpus": [...]` array as above, or `"cpumask": "prime"` to reference a
+named array under `modules.sched.cpumask`. The daemon matches this mask to
+the kernel policy's `related_cpus`; power-model array order is not used to
+infer topology.
 
 ### Sysfs Knobs
 
@@ -203,21 +209,21 @@ the Free Software Foundation, either version 3 of the License, or
 
 - [x] Project scaffolding + CMake build system
 - [x] Logging subsystem (journald + file + stderr)
-- [x] JSON config parser with validation + hot-reload
+- [x] JSON config parser with validation + SIGHUP/DBus hot-reload
 - [x] Sysfs writer with batching + deduplication
 - [x] Power model (P-F curve, sweet spot selection)
 - [x] State machine (7 scenes, timer-based transitions)
 - [x] Input monitor (evdev touch event parsing)
-- [x] cgroup v2 manager (slices, uClamp, CPU pinning)
+- [ ] Per-task affinity scheduling (helpers exist; runtime policy is not enabled)
 - [x] HeavyLoad detector (/proc/stat polling)
 - [x] Game scanner (/proc scanning)
 - [x] SM8550 config
 - [x] CLI tool (uperfctl)
 - [x] systemd service unit
 - [x] DBus interface (org.uperflinux.Daemon)
-- [x] GTK4/libadwaita GUI (Dashboard, Games, Settings, Logs, Frequency Override)
+- [x] GTK4/libadwaita GUI (Dashboard, Games, Config reload, Logs, Frequency Override)
 - [x] deb packaging (dpkg-deb)
-- [x] Unit tests (75 tests across 5 test files)
+- [x] Unit and integration tests (CTest, ASan and UBSan)
 - [x] Thermal awareness (read /sys/class/thermal/, frequency capping, DBus exposure)
 - [x] Per-app power mode auto-switching (perapp_powermode parser, game scanner integration, GUI wiring)
 - [x] Config generation wizard for new SoCs

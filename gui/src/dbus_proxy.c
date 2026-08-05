@@ -7,37 +7,9 @@
 #define DAEMON_BUS    "org.uperflinux.Daemon"
 #define DAEMON_PATH   "/org/uperflinux/Daemon"
 #define DAEMON_IFACE  "org.uperflinux.Daemon"
+#define PRIVILEGED_CALL_TIMEOUT_MS 120000
 
-/* Forward declarations for functions referenced in get_type() */
-static void uperf_dbus_proxy_init(DbusProxy *self);
-static void uperf_dbus_proxy_class_init(DbusProxyClass *klass);
-
-/* G_TIMEOUT_DEFAULT was removed in GLib 2.80+, use G_MAXUINT */
-#ifndef G_TIMEOUT_DEFAULT
-#define G_TIMEOUT_DEFAULT G_MAXUINT
-#endif
-
-GType uperf_dbus_proxy_get_type(void) {
-    static gsize type_id = 0;
-    if (g_once_init_enter(&type_id)) {
-        static const GTypeInfo type_info = {
-            sizeof(DbusProxyClass),
-            (GBaseInitFunc)NULL,
-            (GBaseFinalizeFunc)NULL,
-            (GClassInitFunc)uperf_dbus_proxy_class_init,
-            NULL,
-            NULL,
-            sizeof(DbusProxy),
-            0,
-            (GInstanceInitFunc)uperf_dbus_proxy_init,
-        };
-        type_id = g_type_register_static(G_TYPE_OBJECT, "DbusProxy", &type_info, 0);
-        g_once_init_leave(&type_id, type_id);
-    }
-    return type_id;
-}
-
-static gpointer uperf_dbus_proxy_parent_class = NULL;
+G_DEFINE_TYPE(DbusProxy, uperf_dbus_proxy, G_TYPE_OBJECT)
 
 static void uperf_dbus_proxy_init(DbusProxy *self) {
     self->current_mode = g_strdup("balance");
@@ -66,6 +38,14 @@ static void proxy_dispose(GObject *obj) {
     g_free(self->game_comm); self->game_comm = NULL;
     g_free(self->game_pid); self->game_pid = NULL;
     g_free(self->game_mode); self->game_mode = NULL;
+    for (int i = 0; i < self->nr_workloads; i++) {
+        g_free(self->wl_comm[i]);
+        g_free(self->wl_class[i]);
+    }
+    g_free(self->wl_pid); self->wl_pid = NULL;
+    g_free(self->wl_comm); self->wl_comm = NULL;
+    g_free(self->wl_class); self->wl_class = NULL;
+    self->nr_workloads = 0;
     G_OBJECT_CLASS(uperf_dbus_proxy_parent_class)->dispose(obj);
 }
 
@@ -74,7 +54,6 @@ static void proxy_finalize(GObject *obj) {
 }
 
 static void uperf_dbus_proxy_class_init(DbusProxyClass *klass) {
-    uperf_dbus_proxy_parent_class = g_type_class_peek_parent(klass);
     GObjectClass *obj_class = G_OBJECT_CLASS(klass);
     obj_class->dispose  = proxy_dispose;
     obj_class->finalize = proxy_finalize;
@@ -93,7 +72,10 @@ static gboolean poll_properties(gpointer ud) {
     DbusProxy *self = (DbusProxy*)ud;
     GError *err = NULL;
     GDBusProxy *proxy = get_proxy(self, &err);
-    if (!proxy) return G_SOURCE_CONTINUE;
+    if (!proxy) {
+        g_clear_error(&err);
+        return G_SOURCE_CONTINUE;
+    }
 
     GVariant *m = g_dbus_proxy_get_cached_property(proxy, "CurrentMode");
     if (m) {
@@ -141,6 +123,43 @@ static gboolean poll_properties(gpointer ud) {
         g_variant_unref(ts);
     }
 
+    GVariant *ap = g_dbus_proxy_get_cached_property(proxy, "ActiveProcess");
+    if (ap) {
+        self->active_pid = g_variant_get_int32(ap);
+        g_variant_unref(ap);
+    }
+
+    GVariant *ss = g_dbus_proxy_get_cached_property(proxy, "SchedulerStatus");
+    if (ss) {
+        g_variant_get(ss, "(ii)", &self->tracked_processes,
+                      &self->tracked_threads);
+        g_variant_unref(ss);
+    }
+
+    GVariant *mw = g_dbus_proxy_get_cached_property(proxy, "ManagedWorkloads");
+    if (mw) {
+        for (int i = 0; i < self->nr_workloads; i++) {
+            g_free(self->wl_comm[i]);
+            g_free(self->wl_class[i]);
+        }
+        g_free(self->wl_pid);
+        g_free(self->wl_comm);
+        g_free(self->wl_class);
+
+        gsize n = g_variant_n_children(mw);
+        self->wl_pid   = g_malloc0((n + 1) * sizeof(gint));
+        self->wl_comm  = g_malloc0((n + 1) * sizeof(gchar *));
+        self->wl_class = g_malloc0((n + 1) * sizeof(gchar *));
+        self->nr_workloads = (int)n;
+        for (gsize i = 0; i < n; i++) {
+            const gchar *comm = NULL, *cls = NULL;
+            g_variant_get_child(mw, i, "(i&s&s)", &self->wl_pid[i], &comm, &cls);
+            self->wl_comm[i]  = g_strdup(comm ? comm : "");
+            self->wl_class[i] = g_strdup(cls ? cls : "");
+        }
+        g_variant_unref(mw);
+    }
+
     g_object_unref(proxy);
     return G_SOURCE_CONTINUE;
 }
@@ -149,7 +168,10 @@ static gboolean poll_stats(gpointer ud) {
     DbusProxy *self = (DbusProxy*)ud;
     GError *err = NULL;
     GDBusProxy *proxy = get_proxy(self, &err);
-    if (!proxy) return G_SOURCE_CONTINUE;
+    if (!proxy) {
+        g_clear_error(&err);
+        return G_SOURCE_CONTINUE;
+    }
 
     GVariant *fr = g_dbus_proxy_get_cached_property(proxy, "CpuFrequencies");
     if (fr) {
@@ -191,14 +213,17 @@ static gboolean poll_stats(gpointer ud) {
         self->game_mode = g_malloc0(cap * sizeof(gchar*));
         self->nr_games = (int)n_entries;
         for (gsize i = 0; i < n_entries; i++) {
-            GVariant *child;
-            g_variant_get_child(gp, i, "(ii(sssss))",
-                &self->game_pid[i], &child);
-            GVariant *strs;
-            g_variant_get(child, "(sssss)",
-                &self->game_comm[i], &strs, &strs, &strs,
-                &self->game_mode[i], &strs);
-            g_variant_unref(child);
+            const gchar *comm = NULL;
+            const gchar *cmdline = NULL;
+            const gchar *package = NULL;
+            const gchar *mode = NULL;
+            g_variant_get_child(gp, i, "(i&s&s&s&s)",
+                                &self->game_pid[i], &comm, &cmdline,
+                                &package, &mode);
+            (void)cmdline;
+            (void)package;
+            self->game_comm[i] = g_strdup(comm);
+            self->game_mode[i] = g_strdup(mode);
         }
         g_variant_unref(gp);
     }
@@ -226,10 +251,10 @@ void dbus_proxy_set_thermal_cb(DbusProxy *self, GCallback cb, gpointer ud) { sel
 gboolean dbus_proxy_set_mode(DbusProxy *self, const gchar *mode) {
     GError *err = NULL;
     GDBusProxy *proxy = get_proxy(self, &err);
-    if (!proxy) return FALSE;
+    if (!proxy) { g_clear_error(&err); return FALSE; }
     GVariant *ret = g_dbus_proxy_call_sync(proxy, "SetMode",
         g_variant_new("(s)", mode),
-        G_TIMEOUT_DEFAULT, G_TIMEOUT_DEFAULT, NULL, &err);
+        G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
     g_object_unref(proxy);
     if (!ret) { g_warning("SetMode: %s", err->message); g_error_free(err); return FALSE; }
     gboolean ok; g_variant_get(ret, "(b)", &ok); g_variant_unref(ret);
@@ -239,40 +264,32 @@ gboolean dbus_proxy_set_mode(DbusProxy *self, const gchar *mode) {
 gboolean dbus_proxy_set_game_mode(DbusProxy *self, gint pid, const gchar *app, const gchar *mode) {
     GError *err = NULL;
     GDBusProxy *proxy = get_proxy(self, &err);
-    if (!proxy) return FALSE;
+    if (!proxy) { g_clear_error(&err); return FALSE; }
     GVariant *ret = g_dbus_proxy_call_sync(proxy, "SetGameMode",
-        g_variant_new("(i(ss)", pid, app, mode),
-        G_TIMEOUT_DEFAULT, G_TIMEOUT_DEFAULT, NULL, &err);
+        g_variant_new("(iss)", pid, app, mode),
+        G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
     g_object_unref(proxy);
-    if (!ret) { g_error_free(err); return FALSE; }
+    if (!ret) { g_clear_error(&err); return FALSE; }
     gboolean ok; g_variant_get(ret, "(b)", &ok); g_variant_unref(ret);
     return ok;
 }
 
-gboolean dbus_proxy_apply_settings(DbusProxy *self,
-    gdouble heavy_load_thd, gdouble idle_load_thd,
-    gdouble sample_time, gdouble burst_slack,
-    gdouble latency_time, gdouble margin, gdouble burst,
-    gdouble slow_limit, gdouble fast_limit, gdouble fast_limit_cap,
-    gdouble warn_temp, gdouble throttle_temp,
-    gdouble critical_temp, gdouble recovery_temp)
-{
+gboolean dbus_proxy_reload_config(DbusProxy *self) {
     GError *err = NULL;
     GDBusProxy *proxy = get_proxy(self, &err);
-    if (!proxy) return FALSE;
-    GVariant *ret = g_dbus_proxy_call_sync(proxy, "ApplySettings",
-        g_variant_new("(dddddddddddddd)",
-            heavy_load_thd, idle_load_thd,
-            sample_time, burst_slack,
-            latency_time, margin, burst,
-            slow_limit, fast_limit, fast_limit_cap,
-            warn_temp, throttle_temp,
-            critical_temp, recovery_temp),
-        G_TIMEOUT_DEFAULT, G_TIMEOUT_DEFAULT, NULL, &err);
+    if (!proxy) { g_clear_error(&err); return FALSE; }
+    GVariant *ret = g_dbus_proxy_call_sync(proxy, "ReloadConfig", NULL,
+        G_DBUS_CALL_FLAGS_NONE, PRIVILEGED_CALL_TIMEOUT_MS, NULL, &err);
     g_object_unref(proxy);
-    if (ret) { g_variant_unref(ret); return TRUE; }
-    if (err) { g_debug("ApplySettings: %s", err->message); g_error_free(err); }
-    return FALSE;
+    if (!ret) {
+        g_warning("ReloadConfig: %s", err ? err->message : "request failed");
+        g_clear_error(&err);
+        return FALSE;
+    }
+    gboolean accepted = FALSE;
+    g_variant_get(ret, "(b)", &accepted);
+    g_variant_unref(ret);
+    return accepted;
 }
 
 gboolean dbus_proxy_apply_freq_override(DbusProxy *self,
@@ -280,21 +297,41 @@ gboolean dbus_proxy_apply_freq_override(DbusProxy *self,
 {
     GError *err = NULL;
     GDBusProxy *proxy = get_proxy(self, &err);
-    if (!proxy) return FALSE;
-    g_dbus_proxy_call_sync(proxy, "SetManualFreq",
-        g_variant_new("(ix)", 0, prime),
-        G_TIMEOUT_DEFAULT, G_TIMEOUT_DEFAULT, NULL, NULL);
-    g_dbus_proxy_call_sync(proxy, "SetManualFreq",
-        g_variant_new("(ix)", 1, perf),
-        G_TIMEOUT_DEFAULT, G_TIMEOUT_DEFAULT, NULL, NULL);
-    g_dbus_proxy_call_sync(proxy, "SetManualFreq",
-        g_variant_new("(ix)", 2, eff),
-        G_TIMEOUT_DEFAULT, G_TIMEOUT_DEFAULT, NULL, NULL);
-    g_dbus_proxy_call_sync(proxy, "SetManualFreq",
-        g_variant_new("(ix)", -1, gpu),
-        G_TIMEOUT_DEFAULT, G_TIMEOUT_DEFAULT, NULL, NULL);
+    if (!proxy) { g_clear_error(&err); return FALSE; }
+    const gint clusters[] = {0, 1, 2, -1};
+    const gint64 frequencies[] = {prime, perf, eff, gpu};
+    gboolean success = TRUE;
+    for (guint i = 0; i < G_N_ELEMENTS(clusters); i++) {
+        GVariant *ret = g_dbus_proxy_call_sync(
+            proxy, "SetManualFreq",
+            g_variant_new("(ix)", clusters[i], frequencies[i]),
+            G_DBUS_CALL_FLAGS_NONE, PRIVILEGED_CALL_TIMEOUT_MS, NULL, &err);
+        gboolean accepted = FALSE;
+        if (ret) {
+            g_variant_get(ret, "(b)", &accepted);
+            g_variant_unref(ret);
+        }
+        if (!accepted) {
+            g_warning("SetManualFreq cluster %d failed: %s", clusters[i],
+                      err ? err->message : "request rejected");
+            success = FALSE;
+            /* Avoid leaving a partial set when a later policy rejects the
+             * requested frequency. */
+            for (guint rollback = 0; rollback < i; rollback++) {
+                GVariant *released = g_dbus_proxy_call_sync(
+                    proxy, "SetManualFreq",
+                    g_variant_new("(ix)", clusters[rollback], (gint64)0),
+                    G_DBUS_CALL_FLAGS_NONE, PRIVILEGED_CALL_TIMEOUT_MS,
+                    NULL, NULL);
+                if (released) g_variant_unref(released);
+            }
+            g_clear_error(&err);
+            break;
+        }
+        g_clear_error(&err);
+    }
     g_object_unref(proxy);
-    return TRUE;
+    return success;
 }
 
 gboolean dbus_proxy_release_freq_override(DbusProxy *self) {

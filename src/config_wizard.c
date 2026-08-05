@@ -4,7 +4,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
 #include <dirent.h>
 #include <ctype.h>
 #include <fcntl.h>
@@ -14,6 +13,7 @@
 #include <sys/types.h>
 #include <linux/input.h>
 #include <errno.h>
+#include <stdint.h>
 
 /* Bitops helpers for ioctl bitmasks */
 #define ABSBIT_WORDS (((EV_ABS + 31) / 32) * ((ABS_MAX + 31) / 32))
@@ -25,15 +25,6 @@ static inline int test_bit(int nr, const unsigned long *addr) {
 
 /* Indentation level */
 static int json_indent = 0;
-
-static void json_print(FILE *fp, const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    for (int i = 0; i < json_indent; i++)
-        fputs("  ", fp);
-    vfprintf(fp, fmt, ap);
-    va_end(ap);
-}
 
 static void json_indent_in(void)  { json_indent++; }
 static void json_indent_out(void) { json_indent--; if (json_indent < 0) json_indent = 0; }
@@ -76,6 +67,67 @@ static void json_write_string(FILE *fp, const char *s) {
 
 /* ---- Hardware detection functions ---- */
 
+typedef struct {
+    int policy_id;
+    int nr_cpus;
+    uint64_t cpu_mask;
+    long min_khz;
+    long max_khz;
+} CpuPolicy;
+
+static int compare_policy_max_desc(const void *lhs, const void *rhs) {
+    const CpuPolicy *a = lhs;
+    const CpuPolicy *b = rhs;
+    if (a->max_khz < b->max_khz) return 1;
+    if (a->max_khz > b->max_khz) return -1;
+    return a->policy_id - b->policy_id;
+}
+
+static long read_long_file(const char *path) {
+    char *value = read_file(path);
+    if (!value) return 0;
+    char *end = NULL;
+    errno = 0;
+    long result = strtol(value, &end, 10);
+    if (errno != 0 || end == value) result = 0;
+    free(value);
+    return result;
+}
+
+static uint64_t parse_cpu_list_mask(const char *list) {
+    uint64_t mask = 0;
+    const char *cursor = list;
+    while (cursor && *cursor) {
+        while (isspace((unsigned char)*cursor) || *cursor == ',') cursor++;
+        if (!isdigit((unsigned char)*cursor)) break;
+        char *end = NULL;
+        long first = strtol(cursor, &end, 10);
+        if (end == cursor || first < 0 || first >= 64) return 0;
+        cursor = end;
+        long last = first;
+        if (*cursor == '-') {
+            cursor++;
+            last = strtol(cursor, &end, 10);
+            if (end == cursor || last < first || last >= 64) return 0;
+            cursor = end;
+        }
+        for (long cpu = first; cpu <= last; cpu++)
+            mask |= UINT64_C(1) << cpu;
+    }
+    return mask;
+}
+
+static void emit_cpu_mask_array(FILE *fp, uint64_t mask) {
+    fputc('[', fp);
+    int written = 0;
+    for (int cpu = 0; cpu < 64; cpu++) {
+        if ((mask & (UINT64_C(1) << cpu)) == 0) continue;
+        if (written++ > 0) fputs(", ", fp);
+        fprintf(fp, "%d", cpu);
+    }
+    fputc(']', fp);
+}
+
 /* Detect CPU topology from /sys/devices/system/cpu/ */
 static void detect_cpu_topology(FILE *fp) {
     fprintf(fp, "  \"cpu\": {\n");
@@ -84,126 +136,109 @@ static void detect_cpu_topology(FILE *fp) {
     fprintf(fp, "    \"enable\": true,\n");
     fprintf(fp, "    \"powerModel\": [\n");
 
-    /* Determine cluster layout by reading scaling_driver per CPU */
-    int total_cpus = 0;
-    int clusters[4] = {0};  /* Count CPUs per cluster (by driver match) */
-    int nr_clusters = 0;
-    float typical_freqs[4] = {0};
-    int efficiencies[4] = {0};
+    CpuPolicy policies[4] = {0};
+    int nr_policies = 0;
+    DIR *policy_dir = opendir("/sys/devices/system/cpu/cpufreq");
+    if (policy_dir) {
+        struct dirent *entry;
+        while ((entry = readdir(policy_dir)) != NULL && nr_policies < 4) {
+            if (strncmp(entry->d_name, "policy", 6) != 0 ||
+                !isdigit((unsigned char)entry->d_name[6]))
+                continue;
 
-    DIR *cpu_dir = opendir("/sys/devices/system/cpu");
-    if (!cpu_dir) {
-        fprintf(fp, "      /* Cannot read /sys/devices/system/cpu */\n");
-        goto cpu_done;
-    }
+            char *end = NULL;
+            long policy_id = strtol(entry->d_name + 6, &end, 10);
+            if (!end || *end != '\0' || policy_id < 0) continue;
 
-    /* Count total CPUs by walking cpu0..cpuN */
-    for (int cpu = 0; cpu < 16; cpu++) {
-        char path[256];
-        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d", cpu);
-        struct stat st;
-        if (stat(path, &st) != 0) break;  /* No more CPUs */
-        total_cpus++;
-    }
-    closedir(cpu_dir);
+            char path[512];
+            snprintf(path, sizeof(path),
+                     "/sys/devices/system/cpu/cpufreq/%s/related_cpus",
+                     entry->d_name);
+            char *related = read_file(path);
+            uint64_t cpu_mask = parse_cpu_list_mask(related);
+            int nr_cpus = __builtin_popcountll(cpu_mask);
+            free(related);
+            if (nr_cpus <= 0) continue;
 
-    /* Assume cluster layout based on total CPU count */
-    if (total_cpus == 8) {
-        clusters[0] = 1; clusters[1] = 2; clusters[2] = 5;
-        nr_clusters = 3;
-        typical_freqs[0] = 2400; typical_freqs[1] = 2200; typical_freqs[2] = 1600;
-        efficiencies[0] = 350; efficiencies[1] = 280; efficiencies[2] = 180;
-    } else if (total_cpus == 4) {
-        clusters[0] = 1; clusters[1] = 3;
-        nr_clusters = 2;
-        typical_freqs[0] = 2800; typical_freqs[1] = 2000;
-        efficiencies[0] = 400; efficiencies[1] = 200;
-    } else if (total_cpus == 6) {
-        clusters[0] = 1; clusters[1] = 1; clusters[2] = 4;
-        nr_clusters = 3;
-        typical_freqs[0] = 3000; typical_freqs[1] = 2400; typical_freqs[2] = 1800;
-        efficiencies[0] = 400; efficiencies[1] = 300; efficiencies[2] = 180;
-    } else if (total_cpus == 2) {
-        clusters[0] = 2;
-        nr_clusters = 1;
-        typical_freqs[0] = 2000;
-        efficiencies[0] = 200;
-    } else {
-        /* Generic: assume single cluster */
-        clusters[0] = total_cpus;
-        nr_clusters = 1;
-        typical_freqs[0] = 1800;
-        efficiencies[0] = 150;
-    }
-
-    /* Try to read actual max frequency from sysfs to refine defaults */
-    char freq_path[256];
-    snprintf(freq_path, sizeof(freq_path),
-             "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq");
-    char *max_freq_str = read_file(freq_path);
-    if (max_freq_str) {
-        int max_freq_khz = atoi(max_freq_str);
-        if (max_freq_khz > 0) {
-            float max_freq_mhz = max_freq_khz / 1000.0f;
-            /* Use actual max freq to scale cluster frequencies */
-            for (int c = 0; c < nr_clusters; c++) {
-                if (typical_freqs[c] == 0)
-                    typical_freqs[c] = max_freq_mhz * 0.7f;
-                if (efficiencies[c] == 0)
-                    efficiencies[c] = 150 + c * 80;
+            CpuPolicy *policy = &policies[nr_policies];
+            policy->policy_id = (int)policy_id;
+            policy->nr_cpus = nr_cpus;
+            policy->cpu_mask = cpu_mask;
+            snprintf(path, sizeof(path),
+                     "/sys/devices/system/cpu/cpufreq/%s/cpuinfo_min_freq",
+                     entry->d_name);
+            policy->min_khz = read_long_file(path);
+            snprintf(path, sizeof(path),
+                     "/sys/devices/system/cpu/cpufreq/%s/cpuinfo_max_freq",
+                     entry->d_name);
+            policy->max_khz = read_long_file(path);
+            if (policy->max_khz <= 0) {
+                snprintf(path, sizeof(path),
+                         "/sys/devices/system/cpu/cpufreq/%s/scaling_max_freq",
+                         entry->d_name);
+                policy->max_khz = read_long_file(path);
             }
+            if (policy->max_khz <= 0) continue;
+            nr_policies++;
         }
-        free(max_freq_str);
+        closedir(policy_dir);
     }
 
-    /* Read available frequencies from first CPU for more accuracy */
-    snprintf(freq_path, sizeof(freq_path),
-             "/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies");
-    char *avail_freqs = read_file(freq_path);
-    if (avail_freqs) {
-        /* Find the max available frequency */
-        int max_avail = 0, val;
-        char *tok = strtok(avail_freqs, " ");
-        while (tok) {
-            val = atoi(tok);
-            if (val > max_avail) max_avail = val;
-            tok = strtok(NULL, " ");
-        }
-        if (max_avail > 0) {
-            float max_avail_mhz = max_avail / 1000.0f;
-            /* If we got a real max from sysfs, use it to scale */
-            for (int c = 0; c < nr_clusters; c++) {
-                if (clusters[c] > 0) {
-                    /* Prime cluster gets full max, others scaled down */
-                    if (c == 0) {
-                        typical_freqs[c] = max_avail_mhz;
-                    } else {
-                        typical_freqs[c] = max_avail_mhz * (1.0f / (c + 1));
-                        if (typical_freqs[c] < 500) typical_freqs[c] = 500;
-                    }
-                }
-            }
-        }
-        free(avail_freqs);
+    if (nr_policies == 0) {
+        long online = sysconf(_SC_NPROCESSORS_ONLN);
+        policies[0] = (CpuPolicy){
+            .policy_id = 0,
+            .nr_cpus = online > 0 ? (int)online : 1,
+            .min_khz = 300000,
+            .max_khz = 1800000,
+        };
+        int fallback_cpus = policies[0].nr_cpus < 64
+            ? policies[0].nr_cpus : 64;
+        policies[0].cpu_mask = fallback_cpus == 64
+            ? UINT64_MAX : (UINT64_C(1) << fallback_cpus) - 1;
+        nr_policies = 1;
     }
 
-    for (int c = 0; c < nr_clusters; c++) {
+    qsort(policies, (size_t)nr_policies, sizeof(policies[0]),
+          compare_policy_max_desc);
+
+    for (int c = 0; c < nr_policies; c++) {
+        float max_mhz = policies[c].max_khz / 1000.0f;
+        float min_mhz = policies[c].min_khz > 0
+            ? policies[c].min_khz / 1000.0f : max_mhz * 0.2f;
+        float free_mhz = max_mhz * 0.25f;
+        if (free_mhz < min_mhz) free_mhz = min_mhz;
+        int efficiency = nr_policies == 1
+            ? 250 : 180 + (nr_policies - 1 - c) * 85;
+        float typical_power = 0.8f + (nr_policies - 1 - c) * 0.3f;
+
         if (c > 0) fprintf(fp, ",\n");
         fprintf(fp, "      {\n");
-        fprintf(fp, "        \"efficiency\": %d,\n", efficiencies[c]);
-        fprintf(fp, "        \"nr\": %d,\n", clusters[c]);
-        fprintf(fp, "        \"typicalPower\": %.1f,\n", 0.8f + c * 0.3f);
-        fprintf(fp, "        \"typicalFreq\": %.0f,\n", typical_freqs[c]);
-        fprintf(fp, "        \"sweetFreq\": %.0f,\n", typical_freqs[c] * 0.7f);
-        fprintf(fp, "        \"plainFreq\": %.0f,\n", typical_freqs[c] * 0.5f);
-        fprintf(fp, "        \"freeFreq\": %.0f\n", typical_freqs[c] * 0.25f);
+        fprintf(fp, "        \"efficiency\": %d,\n", efficiency);
+        fprintf(fp, "        \"nr\": %d,\n", policies[c].nr_cpus);
+        fprintf(fp, "        \"cpus\": ");
+        emit_cpu_mask_array(fp, policies[c].cpu_mask);
+        fprintf(fp, ",\n");
+        fprintf(fp, "        \"typicalPower\": %.1f,\n", typical_power);
+        fprintf(fp, "        \"typicalFreq\": %.0f,\n", max_mhz);
+        fprintf(fp, "        \"sweetFreq\": %.0f,\n", max_mhz * 0.75f);
+        fprintf(fp, "        \"plainFreq\": %.0f,\n", max_mhz * 0.55f);
+        fprintf(fp, "        \"freeFreq\": %.0f\n", free_mhz);
         fprintf(fp, "      }");
     }
     fprintf(fp, "\n    ]\n");
 
-cpu_done:
     json_indent_out();
     fprintf(fp, "  },\n");
+}
+
+static void emit_sysfs_knob(FILE *fp, int *count, const char *name,
+                            const char *path) {
+    if ((*count)++ > 0) fprintf(fp, ",\n");
+    fprintf(fp, "      ");
+    json_write_string(fp, name);
+    fprintf(fp, ": ");
+    json_write_string(fp, path);
 }
 
 /* Detect sysfs knobs from /sys/class/devfreq/ */
@@ -213,62 +248,61 @@ static void detect_devfreq(FILE *fp) {
     fprintf(fp, "    \"enable\": true,\n");
     fprintf(fp, "    \"knob\": {\n");
 
-    /* Base cpufreq knobs */
-    fprintf(fp, "      \"cpufreqMax\": \"/sys/devices/system/cpu/cpu%%d/cpufreq/scaling_max_freq\",\n");
-    fprintf(fp, "      \"cpufreqMin\": \"/sys/devices/system/cpu/cpu%%d/cpufreq/scaling_min_freq\",\n");
-    fprintf(fp, "      \"cpufreqGovernor\": \"/sys/devices/system/cpu/cpu%%d/cpufreq/scaling_governor\",\n");
+    int nr_knobs = 0;
+    emit_sysfs_knob(fp, &nr_knobs, "cpufreqMax",
+                    "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq");
+    emit_sysfs_knob(fp, &nr_knobs, "cpufreqMin",
+                    "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_min_freq");
+    emit_sysfs_knob(fp, &nr_knobs, "cpufreqGovernor",
+                    "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor");
 
     /* Scan devfreq devices */
     DIR *df = opendir("/sys/class/devfreq");
     if (df) {
         struct dirent *ent;
-        int nr_devfreq = 0;
         while ((ent = readdir(df)) != NULL) {
-            if (strncmp(ent->d_name, "soc", 3) != 0 &&
-                strncmp(ent->d_name, "gpu", 3) != 0 &&
-                strncmp(ent->d_name, "cpu", 3) != 0)
-                continue;
+            if (ent->d_name[0] == '.') continue;
 
-            char path[256];
-            snprintf(path, sizeof(path), "/sys/class/devfreq/%s/max_freq", ent->d_name);
-            if (access(path, F_OK) == 0) {
-                if (nr_devfreq > 0) fprintf(fp, ",\n");
-                /* Escape colons in devfreq device names for sysfs path */
-                char escaped_name[128] = {0};
-                const char *src = ent->d_name;
-                char *dst = escaped_name;
-                while (*src && dst < escaped_name + sizeof(escaped_name) - 4) {
-                    if (*src == ':') {
-                        *dst++ = '\\';
-                        *dst++ = ':';
-                    } else {
-                        *dst++ = *src;
-                    }
-                    src++;
+            char name_path[512];
+            snprintf(name_path, sizeof(name_path), "/sys/class/devfreq/%s/name",
+                     ent->d_name);
+            char *device_name = read_file(name_path);
+            const char *name = device_name ? device_name : ent->d_name;
+
+            const char *prefix = NULL;
+            if (strstr(name, "gpu")) prefix = "gpu";
+            else if (strstr(name, "cpu-cpu-llcc-bw")) prefix = "memBw";
+            else if (strstr(name, "cpu-llcc-ddr-bw")) prefix = "ddr";
+            else if (strstr(name, "soc")) prefix = "soc";
+
+            if (prefix) {
+                char knob_name[64];
+                char path[512];
+                snprintf(path, sizeof(path), "/sys/class/devfreq/%s/max_freq",
+                         ent->d_name);
+                if (access(path, F_OK) == 0) {
+                    snprintf(knob_name, sizeof(knob_name), "%sMaxFreq", prefix);
+                    emit_sysfs_knob(fp, &nr_knobs, knob_name, path);
                 }
-                *dst = '\0';
-
-                /* Determine a meaningful knob name from the device name */
-                char knob_name[64] = {0};
-                if (strstr(ent->d_name, "gpu"))
-                    strcpy(knob_name, "gpuMaxFreq");
-                else if (strstr(ent->d_name, "cpu-cpu-llcc-bw"))
-                    strcpy(knob_name, "memBwMax");
-                else if (strstr(ent->d_name, "cpu-llcc-ddr-bw"))
-                    strcpy(knob_name, "ddrMaxFreq");
-                else if (strstr(ent->d_name, "soc"))
-                    strcpy(knob_name, "socMaxFreq");
-                else
-                    snprintf(knob_name, sizeof(knob_name), "%sFreq", ent->d_name);
-
-                fprintf(fp, "      \"%s\": \"/sys/class/devfreq/%s\"",
-                        knob_name, escaped_name);
-                nr_devfreq++;
+                snprintf(path, sizeof(path), "/sys/class/devfreq/%s/min_freq",
+                         ent->d_name);
+                if (access(path, F_OK) == 0) {
+                    snprintf(knob_name, sizeof(knob_name), "%sMinFreq", prefix);
+                    emit_sysfs_knob(fp, &nr_knobs, knob_name, path);
+                }
+                snprintf(path, sizeof(path), "/sys/class/devfreq/%s/governor",
+                         ent->d_name);
+                if (access(path, F_OK) == 0) {
+                    snprintf(knob_name, sizeof(knob_name), "%sGovernor", prefix);
+                    emit_sysfs_knob(fp, &nr_knobs, knob_name, path);
+                }
             }
+            free(device_name);
         }
         closedir(df);
-        if (nr_devfreq > 0) fprintf(fp, "\n");
     }
+
+    fprintf(fp, "\n");
 
     json_indent_out();
     fprintf(fp, "    }\n");
@@ -286,43 +320,7 @@ static void detect_thermal(FILE *fp) {
     fprintf(fp, "    \"critical_temp\": 95000,\n");
     fprintf(fp, "    \"recovery_temp\": 75000,\n");
 
-    /* List discovered zones */
-    DIR *td = opendir("/sys/class/thermal");
-    if (td) {
-        fprintf(fp, "    \"zones\": [\n");
-        struct dirent *ent;
-        int first = 1;
-        while ((ent = readdir(td)) != NULL) {
-            if (strncmp(ent->d_name, "thermal_zone", 12) != 0) continue;
-            char *endptr;
-            strtol(ent->d_name + 12, &endptr, 10);
-            if (*endptr != '\0') continue;
-
-            char type_path[256], temp_path[256];
-            snprintf(type_path, sizeof(type_path),
-                     "/sys/class/thermal/%s/type", ent->d_name);
-            snprintf(temp_path, sizeof(temp_path),
-                     "/sys/class/thermal/%s/temp", ent->d_name);
-
-            char *type = read_file(type_path);
-            char *temp = read_file(temp_path);
-
-            if (!first) fprintf(fp, ",\n");
-            fprintf(fp, "      {\"id\": ");
-            json_write_string(fp, ent->d_name);
-            fprintf(fp, ", \"type\": ");
-            json_write_string(fp, type ? type : "unknown");
-            fprintf(fp, ", \"temp_millidegC\": %s}",
-                    temp ? temp : "0");
-            first = 0;
-            free(type);
-            free(temp);
-        }
-        closedir(td);
-        fprintf(fp, "\n    ]\n");
-    } else {
-        fprintf(fp, "    \"zones\": []\n");
-    }
+    fprintf(fp, "    \"monitor_all_zones\": true\n");
 
     json_indent_out();
     fprintf(fp, "  },\n");
@@ -332,7 +330,7 @@ static void detect_thermal(FILE *fp) {
 static void detect_touchscreen(FILE *fp) {
     fprintf(fp, "  \"input\": {\n");
     json_indent_in();
-    fprintf(fp, "    \"enable\": true,\n");
+    /* enable is written after probing /dev/input below */
 
     /* Check for touchscreen devices by looking for ABS_MT axes */
     int has_touch = 0;
@@ -342,7 +340,7 @@ static void detect_touchscreen(FILE *fp) {
         /* Scan for event devices and check for MT capability */
         while ((ent = readdir(input_dir)) != NULL && !has_touch) {
             if (strncmp(ent->d_name, "event", 5) != 0) continue;
-            char evdev_path[256];
+            char evdev_path[512];
             snprintf(evdev_path, sizeof(evdev_path), "/dev/input/%s", ent->d_name);
             int fd = open(evdev_path, O_RDONLY);
             if (fd >= 0) {
@@ -360,9 +358,29 @@ static void detect_touchscreen(FILE *fp) {
         closedir(input_dir);
     }
 
+    /* Unprivileged users often cannot open /dev/input/event*. Fall back to
+     * the world-readable sysfs device names so detect does not disable touch
+     * merely because it was run without membership in the input group. */
+    if (!has_touch) {
+        DIR *sys_input = opendir("/sys/class/input");
+        if (sys_input) {
+            struct dirent *ent;
+            while ((ent = readdir(sys_input)) != NULL && !has_touch) {
+                if (strncmp(ent->d_name, "event", 5) != 0) continue;
+                char name_path[512];
+                snprintf(name_path, sizeof(name_path),
+                         "/sys/class/input/%s/device/name", ent->d_name);
+                char *name = read_file(name_path);
+                if (name && strcasestr(name, "touchscreen")) has_touch = 1;
+                free(name);
+            }
+            closedir(sys_input);
+        }
+    }
+
     /* Try to read screen resolution from DRM/KMS or fbdev */
     int screen_w = 1080, screen_h = 2400;  /* Default for tablet */
-    char drm_path[256];
+    char drm_path[512];
     DIR *drm_dir = opendir("/sys/class/drm");
     if (drm_dir) {
         struct dirent *ent;
@@ -385,7 +403,7 @@ static void detect_touchscreen(FILE *fp) {
         closedir(drm_dir);
     }
 
-    fprintf(fp, "    \"has_touchscreen\": %s,\n", has_touch ? "true" : "false");
+    fprintf(fp, "    \"enable\": %s,\n", has_touch ? "true" : "false");
     fprintf(fp, "    \"screen_width\": %d,\n", screen_w);
     fprintf(fp, "    \"screen_height\": %d,\n", screen_h);
     fprintf(fp, "    \"swipeThd\": 0.03,\n");
@@ -394,29 +412,7 @@ static void detect_touchscreen(FILE *fp) {
     fprintf(fp, "    \"gestureDelayTime\": 2.0,\n");
     fprintf(fp, "    \"holdEnterTime\": 1.0\n");
     json_indent_out();
-    fprintf(fp, "  },\n");
-}
-
-/* Detect available governors */
-static void detect_governors(FILE *fp) {
-    fprintf(fp, "  \"governors\": [\n");
-    char path[256];
-    snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors");
-    char *govs = read_file(path);
-    if (govs) {
-        char *tok = strtok(govs, " ");
-        int first = 1;
-        while (tok) {
-            if (!first) fprintf(fp, ", ");
-            fprintf(fp, "\"%s\"", tok);
-            first = 0;
-            tok = strtok(NULL, " ");
-        }
-        free(govs);
-    } else {
-        fprintf(fp, "\"schedutil\"");
-    }
-    fprintf(fp, "],\n");
+    fprintf(fp, "  }\n");
 }
 
 /* Generate a baseline JSON config */
@@ -451,7 +447,6 @@ static void generate_config(FILE *fp, const char *soc_name) {
 
     detect_cpu_topology(fp);
     detect_devfreq(fp);
-    detect_governors(fp);
     detect_thermal(fp);
     detect_touchscreen(fp);
 
@@ -475,14 +470,6 @@ static void generate_config(FILE *fp, const char *soc_name) {
     fprintf(fp, "\"burst\": 0.0,\n");
     fprintf(fp, "\"guideCap\": false,\n");
     fprintf(fp, "\"limitEfficiency\": false\n");
-    json_indent_out();
-    fprintf(fp, "    },\n");
-    fprintf(fp, "    \"sysfs\": {\n");
-    json_indent_in();
-    fprintf(fp, "\"cpufreqMax\": \"9999000\",\n");
-    fprintf(fp, "\"cpufreqMin\": \"0\",\n");
-    fprintf(fp, "\"gpuMaxFreq\": \"999900000\",\n");
-    fprintf(fp, "\"gpuMinFreq\": \"0\"\n");
     json_indent_out();
     fprintf(fp, "    }\n");
     json_indent_out();
@@ -517,7 +504,6 @@ static void print_usage(const char *prog) {
         "Commands:\n"
         "  detect              Scan hardware and print baseline JSON config to stdout\n"
         "  detect --output F   Write baseline config to file F\n"
-        "  calibrate           Run calibration stress tests (TODO)\n"
         "  help                Show this help\n",
         prog);
 }
@@ -552,10 +538,6 @@ int main(int argc, char *argv[]) {
                 }
             }
         }
-        if (strcmp(argv[i], "calibrate") == 0) {
-            fprintf(stderr, "Calibration not yet implemented.\n");
-            return 1;
-        }
     }
 
     FILE *fp = stdout;
@@ -574,9 +556,10 @@ int main(int argc, char *argv[]) {
 
     if (close_fp) {
         fclose(fp);
-        printf("Config written to %s\n", output_file);
+        fprintf(stderr, "Config written to %s\n", output_file);
     } else {
-        printf("(config printed to stdout — redirect with > config.json)\n");
+        fprintf(stderr,
+                "(config printed to stdout — redirect with > config.json)\n");
     }
 
     return 0;

@@ -1,8 +1,14 @@
+#define _POSIX_C_SOURCE 200809L
 #include "../src/include/game_scanner.h"
 #include "../src/include/log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <time.h>
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -16,6 +22,22 @@ static int tests_failed = 0;
 } while(0)
 #define ASSERT_PASS(msg) do { \
     printf("PASS\n"); tests_passed++; \
+} while(0)
+#define ASSERT_EQ(a, b, msg) do { \
+    int _actual = (int)(a); \
+    int _expected = (int)(b); \
+    if (_actual != _expected) { \
+        printf("FAIL (%s: expected %d, got %d)\n", msg, _expected, _actual); \
+        tests_failed++; return; \
+    } \
+} while(0)
+#define ASSERT_GT(a, b, msg) do { \
+    int _actual = (int)(a); \
+    int _limit = (int)(b); \
+    if (_actual <= _limit) { \
+        printf("FAIL (%s: expected >%d, got %d)\n", msg, _limit, _actual); \
+        tests_failed++; return; \
+    } \
 } while(0)
 
 /* Test: game_scanner_match with known game patterns */
@@ -79,6 +101,14 @@ TEST(test_no_match_sshd) {
     ASSERT_PASS("sshd not matched");
 }
 
+TEST(test_no_match_generic_words) {
+    ASSERT_EQ(game_scanner_match("codex", "/usr/bin/codex"), 0,
+              "codex no match");
+    ASSERT_EQ(game_scanner_match("kingston", "/usr/bin/kingston-tool"), 0,
+              "kingston no match");
+    ASSERT_PASS("generic substrings are not classified as games");
+}
+
 TEST(test_no_match_null) {
     ASSERT_EQ(game_scanner_match(NULL, NULL), 0, "null match");
     ASSERT_PASS("null inputs return no match");
@@ -130,27 +160,86 @@ TEST(test_get_results) {
     ASSERT_PASS("get results works");
 }
 
-static int ASSERT_EQ(int a, int b, const char *msg) {
-    if (a != b) {
-        printf("FAIL (%s: expected %d, got %d)\n", msg, b, a);
-        tests_failed++;
-        return 1;
+TEST(test_persist_app_mode) {
+    char path[] = "/tmp/uperf-perapp-test-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) { printf("FAIL (mkstemp)\n"); tests_failed++; return; }
+    FILE *fp = fdopen(fd, "w");
+    if (!fp) { close(fd); unlink(path); tests_failed++; return; }
+    fputs("# existing rules\n.* balance\n", fp);
+    fclose(fp);
+
+    GameScanner *gs = game_scanner_new();
+    if (!gs) { unlink(path); tests_failed++; return; }
+    ASSERT_EQ(game_scanner_set_app_mode(gs, path, "ExampleGame",
+                                        "performance"), 0,
+              "persist app mode");
+    fp = fopen(path, "r");
+    char first_line[128] = {0};
+    if (fp) {
+        if (!fgets(first_line, sizeof(first_line), fp))
+            first_line[0] = '\0';
+        fclose(fp);
     }
-    return 0;
+    ASSERT_EQ(strcmp(first_line, "ExampleGame performance\n"), 0,
+              "new rule is first");
+    ASSERT_EQ(game_scanner_set_app_mode(gs, path, "ExampleGame",
+                                        "powersave"), 0,
+              "replace existing app rule");
+    fp = fopen(path, "r");
+    int matching_rules = 0;
+    while (fp && fgets(first_line, sizeof(first_line), fp)) {
+        if (strncmp(first_line, "ExampleGame ", 12) == 0)
+            matching_rules++;
+    }
+    if (fp) fclose(fp);
+    ASSERT_EQ(matching_rules, 1, "app rule is replaced instead of duplicated");
+    game_scanner_free(gs);
+    unlink(path);
+    ASSERT_PASS("per-app mode persisted atomically");
 }
 
-static int ASSERT_GT(int a, int b, const char *msg) {
-    if (a <= b) {
-        printf("FAIL (%s: expected >%d, got %d)\n", msg, b, a);
-        tests_failed++;
-        return 1;
+TEST(test_custom_perapp_process_is_detected) {
+    char path[] = "/tmp/uperf-perapp-detect-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) { tests_failed++; return; }
+    FILE *fp = fdopen(fd, "w");
+    if (!fp) { close(fd); unlink(path); tests_failed++; return; }
+    fputs("custom-uperf performance\n.* balance\n", fp);
+    fclose(fp);
+
+    pid_t child = fork();
+    if (child == 0) {
+        prctl(PR_SET_NAME, "custom-uperf", 0, 0, 0);
+        sleep(5);
+        _exit(0);
     }
-    return 0;
+    if (child < 0) { unlink(path); tests_failed++; return; }
+    struct timespec settle = {.tv_sec = 0, .tv_nsec = 20000000L};
+    nanosleep(&settle, NULL);
+
+    GameScanner *gs = game_scanner_new();
+    game_scanner_perapp_scan(gs, path);
+    game_scanner_scan(gs);
+    GameProcess results[MAX_GAMES];
+    int count = game_scanner_get_results(gs, results, MAX_GAMES);
+    bool found = false;
+    for (int i = 0; i < count; i++) {
+        if (results[i].pid == child && results[i].start_time != 0)
+            found = true;
+    }
+
+    kill(child, SIGTERM);
+    waitpid(child, NULL, 0);
+    game_scanner_free(gs);
+    unlink(path);
+    ASSERT_EQ(found, true, "non-default per-app rule should detect process");
+    ASSERT_PASS("custom per-app rules participate in process detection");
 }
 
 int main(void) {
     printf("=== game_scanner tests ===\n");
-    log_init(LOG_WARN, 0, NULL);
+    log_init(UPERF_LOG_WARN, 0, NULL);
 
     RUN_TEST(test_match_unity);
     RUN_TEST(test_match_unreal);
@@ -164,11 +253,14 @@ int main(void) {
     RUN_TEST(test_no_match_normal_process);
     RUN_TEST(test_no_match_systemd);
     RUN_TEST(test_no_match_sshd);
+    RUN_TEST(test_no_match_generic_words);
     RUN_TEST(test_no_match_null);
     RUN_TEST(test_scanner_lifecycle);
     RUN_TEST(test_add_custom_pattern);
     RUN_TEST(test_scan_proc);
     RUN_TEST(test_get_results);
+    RUN_TEST(test_persist_app_mode);
+    RUN_TEST(test_custom_perapp_process_is_detected);
 
     printf("\nResults: %d/%d passed (%d failed)\n",
            tests_passed, tests_run, tests_failed);
