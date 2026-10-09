@@ -52,6 +52,9 @@ struct DbusManager {
     void               *set_game_mode_ud;
     DbusSetManualFreqFunc set_manual_freq_cb;
     void               *set_manual_freq_ud;
+    DbusSetBoostFunc    set_boost_cb;
+    void               *set_boost_ud;
+
     DbusSetActivePidFunc set_active_pid_cb;
     void               *set_active_pid_ud;
 
@@ -65,6 +68,7 @@ struct DbusManager {
     /* Manual frequency overrides */
     gint64             manual_freq[5];
     gboolean           manual_active;
+    gboolean           boost_enabled;
 
     /* Task scheduler / cgroup status */
     int                tracked_processes;
@@ -139,6 +143,13 @@ static const gchar introspection_xml[] =
     "      <arg direction=\"in\" type=\"i\" name=\"pid\"/>\n"
     "      <arg direction=\"in\" type=\"s\" name=\"app\"/>\n"
     "      <arg direction=\"in\" type=\"s\" name=\"mode\"/>\n"
+    "      <arg direction=\"out\" type=\"b\" name=\"success\"/>\n"
+    "    </method>\n"
+    "    <property name=\"BoostEnabled\" type=\"b\" access=\"read\">\n"
+    "      <annotation name=\"org.freedesktop.DBus.Property.EmitsChangedSignal\" value=\"false\"/>\n"
+    "    </property>\n"
+    "    <method name=\"SetBoost\">\n"
+    "      <arg direction=\"in\" type=\"b\" name=\"enabled\"/>\n"
     "      <arg direction=\"out\" type=\"b\" name=\"success\"/>\n"
     "    </method>\n"
     "    <method name=\"SetManualFreq\">\n"
@@ -252,6 +263,7 @@ static void handle_reload_config(DbusManager *mgr,
 static const char *authorization_action_for_method(const char *method_name) {
     if (strcmp(method_name, "SetMode") == 0 ||
         strcmp(method_name, "SetGameMode") == 0 ||
+        strcmp(method_name, "SetBoost") == 0 ||
         strcmp(method_name, "SetActiveProcess") == 0)
         return DBUS_ACTION_CONTROL;
     if (strcmp(method_name, "SetManualFreq") == 0 ||
@@ -346,6 +358,12 @@ static void dispatch_authorized_method(DbusManager *mgr,
             return;
         }
         handle_set_mode(mgr, parameters, invocation);
+        return;
+    } else if (strcmp(method_name, "SetBoost") == 0) {
+        gboolean on = FALSE;
+        g_variant_get(parameters, "(b)", &on);
+        gboolean ok = mgr->set_boost_cb && mgr->set_boost_cb(on, mgr->set_boost_ud);
+        g_dbus_method_invocation_return_value(invocation, g_variant_new("(b)", ok));
         return;
     } else if (strcmp(method_name, "ReloadConfig") == 0) {
         handle_reload_config(mgr, invocation);
@@ -621,6 +639,8 @@ static GVariant *handle_get_property(GDBusConnection *connection,
         return on_get_max_temperature(mgr);
     if (strcmp(property_name, "ThermalState") == 0)
         return on_get_thermal_state(mgr);
+    if (strcmp(property_name, "BoostEnabled") == 0)
+        return g_variant_new_boolean(mgr->boost_enabled);
     if (strcmp(property_name, "ManualFreqOverride") == 0)
         return on_get_manual_freq_override(mgr);
     if (strcmp(property_name, "ActiveProcess") == 0)
@@ -941,6 +961,20 @@ void dbus_manager_set_authorize_handler(DbusManager *mgr,
     if (!mgr) return;
     mgr->authorize_cb = callback;
     mgr->authorize_ud = user_data;
+}
+
+void dbus_manager_set_boost_handler(DbusManager *mgr,
+                                    DbusSetBoostFunc callback,
+                                    void *user_data) {
+    if (!mgr) return;
+    mgr->set_boost_cb = callback;
+    mgr->set_boost_ud = user_data;
+}
+
+void dbus_manager_set_boost(DbusManager *mgr, gboolean on) {
+    if (!mgr) return;
+    mgr->boost_enabled = on ? TRUE : FALSE;
+    dbus_emit_signal(mgr, "BoostChanged", g_variant_new("(b)", mgr->boost_enabled));
 }
 
 void dbus_manager_set_mode_handler(DbusManager *mgr,

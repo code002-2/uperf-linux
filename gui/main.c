@@ -269,6 +269,7 @@ typedef struct {
 
     /* Frequency override */
     GtkWidget    *freq_toggle;
+    GtkWidget    *boost_switch;   /* CPU boost, independent of the pin */
     GtkAdjustment *freq_adj[4];
     GtkWidget    *freq_scale_rows[UPERF_MAX_CLUSTERS + 1];
     guint         nr_freq_rows;
@@ -464,6 +465,20 @@ static void on_freq_toggle(GObject *obj, GParamSpec *pspec, gpointer ud) {
     for (int i = 0; i < UPERF_MAX_CLUSTERS + 1; i++)
         if (g_app.freq_scale_rows[i])
             gtk_widget_set_sensitive(g_app.freq_scale_rows[i], on);
+}
+
+/* CPU boost. The SCMI cpufreq driver keeps a boost bin above the normal table
+ * (4090 -> 4320 MHz here); the switch lets the governor use it. */
+static void on_boost_toggled(GObject *obj, GParamSpec *pspec, gpointer ud) {
+    (void)pspec; (void)ud;
+    if (!g_app.proxy) return;
+    gboolean on = adw_switch_row_get_active(ADW_SWITCH_ROW(obj));
+    if (!dbus_proxy_set_boost(g_app.proxy, on)) {
+        toast(tr("Failed to set boost"));
+        adw_switch_row_set_active(ADW_SWITCH_ROW(obj), !on);
+    } else {
+        toast(on ? tr("Boost enabled") : tr("Boost disabled"));
+    }
 }
 
 static void on_apply_freq(GtkButton *btn, gpointer ud) {
@@ -729,6 +744,17 @@ static GtkWidget *create_frequency_page(void) {
     g_signal_connect(g_app.freq_toggle, "notify::active",
                      G_CALLBACK(on_freq_toggle), NULL);
     adw_preferences_group_add(ADW_PREFERENCES_GROUP(group), g_app.freq_toggle);
+
+    /* CPU boost is independent of the pin: it decides whether the boost bins are usable. */
+    g_app.boost_switch = adw_switch_row_new();
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(g_app.boost_switch), tr("CPU Boost"));
+    adw_action_row_set_subtitle(ADW_ACTION_ROW(g_app.boost_switch),
+        tr("Allow the governor to use frequencies above the normal table."));
+    gint boost_state = g_app.proxy ? dbus_proxy_get_boost(g_app.proxy) : -1;
+    adw_switch_row_set_active(ADW_SWITCH_ROW(g_app.boost_switch), boost_state == 1);
+    g_signal_connect(g_app.boost_switch, "notify::active",
+                     G_CALLBACK(on_boost_toggled), NULL);
+    adw_preferences_group_add(ADW_PREFERENCES_GROUP(group), g_app.boost_switch);
 
     /* Ranges come from the hardware, not from a per-SoC table. */
     FreqRow cl[UPERF_MAX_CLUSTERS + 1];

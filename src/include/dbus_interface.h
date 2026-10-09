@@ -136,6 +136,12 @@ void dbus_manager_set_manual_freq_handler(DbusManager *mgr,
                                            DbusSetManualFreqFunc callback,
                                            void *user_data);
 
+/* Enable or disable CPU boost. Returns false if no cpufreq policy accepted it. */
+typedef gboolean (*DbusSetBoostFunc)(gboolean on, void *user_data);
+void dbus_manager_set_boost_handler(DbusManager *mgr,
+                                    DbusSetBoostFunc callback,
+                                    void *user_data);
+
 typedef gboolean (*DbusSetActivePidFunc)(pid_t pid, void *user_data);
 void dbus_manager_set_active_pid_handler(DbusManager *mgr,
                                          DbusSetActivePidFunc callback,
@@ -155,6 +161,9 @@ void dbus_manager_set_game_mode(DbusManager *mgr, pid_t pid, const char *app_nam
  * cluster: 0=prime, 1=perf, 2=eff, 3=auto=all; -1=GPU
  * freq_hz: target frequency in Hz (0 = release override, resume auto)
  * Returns TRUE if override was accepted. */
+/* Publish the boost state so the GUI can reflect it. */
+void dbus_manager_set_boost(DbusManager *mgr, gboolean on);
+
 gboolean dbus_manager_set_manual_freq(DbusManager *mgr, int cluster,
                                        gint64 freq_hz);
 

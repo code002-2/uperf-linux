@@ -30,6 +30,7 @@
 
 /* Global state */
 static Config g_config;
+static gboolean g_boost_requested;   /* last value requested over D-Bus */
 static StateMachine *g_sm = NULL;
 static InputMonitor *g_im = NULL;
 static SysfsWriter *g_writer = NULL;
@@ -492,6 +493,86 @@ static gboolean write_manual_target(ManualFreqTarget *target, gint64 freq_hz) {
     return result;
 }
 
+
+/* ----------------------------------------------------------------
+ * CPU boost. The SCMI cpufreq driver exposes a boost bin above the
+ * normal table (policy6: 4204.8 / 4320 MHz against a 4089.6 MHz top
+ * bin) and a per-policy "boost" switch that lets the governor use it.
+ * Setting scaling_max_freq to the hardware maximum is not enough on its
+ * own: without boost the governor stays on the normal table.
+ * ---------------------------------------------------------------- */
+#define BOOST_GLOBAL_PATH "/sys/devices/system/cpu/cpufreq/boost"
+
+static gboolean write_boost_one(const char *path, gboolean on) {
+    FILE *fp = fopen(path, "w");
+    if (!fp)
+        return FALSE;
+    int rc = fprintf(fp, "%d\n", on ? 1 : 0);
+    fclose(fp);
+    return rc > 0;
+}
+
+static gboolean set_cpu_boost(gboolean on) {
+    gboolean any = FALSE;
+    for (int i = 0; i < g_nr_cpu_targets; i++) {
+        /* each target knows its own policy directory through min_path */
+        const char *minp = g_manual_cpu[i].min_path;
+        if (!minp || !*minp)
+            continue;
+        char path[MAX_PATH_LEN];
+        const char *slash = strrchr(minp, '/');
+        if (!slash)
+            continue;
+        int n = snprintf(path, sizeof(path), "%.*s/boost", (int)(slash - minp), minp);
+        if (n <= 0 || n >= (int)sizeof(path))
+            continue;
+        if (write_boost_one(path, on))
+            any = TRUE;
+    }
+    /* the cpufreq-level switch governs the whole domain on this driver */
+    if (write_boost_one(BOOST_GLOBAL_PATH, on))
+        any = TRUE;
+    if (any)
+        log_info("CPU boost %s", on ? "enabled" : "disabled");
+    return any;
+}
+
+
+/* Lock every CPU cluster and the GPU to its hardware maximum. */
+static gboolean apply_max_frequencies(void) {
+    gboolean ok = TRUE;
+    for (int i = 0; i < g_nr_cpu_targets; i++) {
+        if (!g_manual_cpu[i].valid)
+            continue;
+        if (!write_manual_target(&g_manual_cpu[i], g_manual_cpu[i].hardware_max_hz))
+            ok = FALSE;
+    }
+    if (g_manual_gpu.valid)
+        if (!write_manual_target(&g_manual_gpu, g_manual_gpu.hardware_max_hz))
+            ok = FALSE;
+    return ok;
+}
+
+/* Undo a lock applied by apply_max_frequencies(). */
+static void release_max_frequencies(void) {
+    for (int i = 0; i < g_nr_cpu_targets; i++) {
+        if (g_manual_cpu[i].valid && g_manual_cpu[i].manual_active)
+            restore_target(&g_manual_cpu[i]);
+    }
+    if (g_manual_gpu.valid && g_manual_gpu.manual_active)
+        restore_target(&g_manual_gpu);
+}
+
+
+/* D-Bus: enable or disable CPU boost. Returns false if no policy accepted the write. */
+static gboolean dbus_boost_handler(gboolean on, void *user_data) {
+    (void)user_data;
+    gboolean ok = set_cpu_boost(on);
+    if (ok)
+        g_boost_requested = on;
+    return ok;
+}
+
 static gboolean dbus_manual_freq_handler(int cluster, gint64 freq_hz,
                                           void *user_data) {
     (void)user_data;
@@ -614,9 +695,23 @@ static const char *power_mode_to_string(PowerMode mode) {
 }
 
 static void apply_power_mode(PowerMode mode, const char *source) {
-    /* fast is a real preset with its own scheduler parameters; do not fold it into
-     * performance, which would make the two modes indistinguishable. */
     if (!g_sm || mode < 0 || mode >= MODE_NUM) return;
+
+    /* fast is not a scheduler preset: it pins every cluster and the GPU to the hardware
+     * maximum and turns CPU boost on, so the boost bins above the normal table become
+     * reachable. Leaving fast releases the pin and restores the governor's own limits. */
+    static gboolean fast_locked = FALSE;
+    if (mode == MODE_FAST) {
+        if (apply_max_frequencies())
+            log_info("fast: locked every cluster and the GPU to their hardware maximum");
+        set_cpu_boost(TRUE);
+        fast_locked = TRUE;
+    } else if (fast_locked) {
+        release_max_frequencies();
+        set_cpu_boost(FALSE);
+        fast_locked = FALSE;
+        log_info("left fast: released the frequency pin and boost");
+    }
     if (state_machine_get_mode(g_sm) == mode) return;
     state_machine_set_mode(g_sm, mode);
     if (g_dbus) dbus_manager_set_mode(g_dbus, power_mode_to_string(mode));
@@ -1220,6 +1315,8 @@ int main(int argc, char *argv[]) {
         dbus_manager_set_reload_handler(g_dbus, dbus_reload_handler, NULL);
         dbus_manager_set_game_mode_handler(g_dbus,
                                            dbus_game_mode_handler, NULL);
+        dbus_manager_set_boost_handler(g_dbus, dbus_boost_handler, NULL);
+
         dbus_manager_set_manual_freq_handler(g_dbus,
                                              dbus_manual_freq_handler, NULL);
         dbus_manager_set_active_pid_handler(g_dbus,

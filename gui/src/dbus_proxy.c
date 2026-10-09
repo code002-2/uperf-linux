@@ -274,6 +274,37 @@ gboolean dbus_proxy_set_game_mode(DbusProxy *self, gint pid, const gchar *app, c
     return ok;
 }
 
+gboolean dbus_proxy_set_boost(DbusProxy *self, gboolean on) {
+    GError *err = NULL;
+    GDBusProxy *proxy = get_proxy(self, &err);
+    if (!proxy) { g_clear_error(&err); return FALSE; }
+    GVariant *ret = g_dbus_proxy_call_sync(proxy, "SetBoost",
+        g_variant_new("(b)", on ? TRUE : FALSE),
+        G_DBUS_CALL_FLAGS_NONE, PRIVILEGED_CALL_TIMEOUT_MS, NULL, &err);
+    g_object_unref(proxy);
+    if (!ret) { g_warning("SetBoost: %s", err->message); g_error_free(err); return FALSE; }
+    gboolean ok; g_variant_get(ret, "(b)", &ok); g_variant_unref(ret);
+    return ok;
+}
+
+/* Read the daemon's boost state. Returns -1 when it cannot be determined. */
+gint dbus_proxy_get_boost(DbusProxy *self) {
+    GError *err = NULL;
+    GDBusProxy *proxy = get_proxy(self, &err);
+    if (!proxy) { g_clear_error(&err); return -1; }
+    GVariant *ret = g_dbus_proxy_call_sync(proxy, "org.freedesktop.DBus.Properties.Get",
+        g_variant_new("(ss)", DAEMON_IFACE, "BoostEnabled"),
+        G_DBUS_CALL_FLAGS_NONE, PRIVILEGED_CALL_TIMEOUT_MS, NULL, &err);
+    g_object_unref(proxy);
+    if (!ret) { g_clear_error(&err); return -1; }
+    GVariant *inner = NULL;
+    g_variant_get(ret, "(v)", &inner);
+    gint value = g_variant_get_boolean(inner) ? 1 : 0;
+    g_variant_unref(inner);
+    g_variant_unref(ret);
+    return value;
+}
+
 gboolean dbus_proxy_reload_config(DbusProxy *self) {
     GError *err = NULL;
     GDBusProxy *proxy = get_proxy(self, &err);

@@ -65,6 +65,9 @@ void  dbus_proxy_set_thermal_cb(DbusProxy *self, GCallback cb, gpointer ud);
 gboolean dbus_proxy_set_mode(DbusProxy *self, const gchar *mode);
 gboolean dbus_proxy_set_game_mode(DbusProxy *self, gint pid, const gchar *app, const gchar *mode);
 gboolean dbus_proxy_reload_config(DbusProxy *self);
+/* CPU boost: the SCMI driver exposes bins above the normal table. */
+gboolean dbus_proxy_set_boost(DbusProxy *self, gboolean on);
+gint     dbus_proxy_get_boost(DbusProxy *self);   /* -1 if unknown */
 /* nr_cpu is the number of CPU clusters the daemon actually exposes; the GPU is always
  * sent as cluster -1. Pass 0 to leave the CPU policies alone. */
 gboolean dbus_proxy_apply_freq_override(DbusProxy *self, gint nr_cpu,
