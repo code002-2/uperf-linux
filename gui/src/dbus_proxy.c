@@ -293,15 +293,31 @@ gboolean dbus_proxy_reload_config(DbusProxy *self) {
 }
 
 gboolean dbus_proxy_apply_freq_override(DbusProxy *self,
-    gint64 prime, gint64 perf, gint64 eff, gint64 gpu)
+    gint nr_cpu, gint64 prime, gint64 perf, gint64 eff, gint64 gpu)
 {
     GError *err = NULL;
     GDBusProxy *proxy = get_proxy(self, &err);
     if (!proxy) { g_clear_error(&err); return FALSE; }
-    const gint clusters[] = {0, 1, 2, -1};
-    const gint64 frequencies[] = {prime, perf, eff, gpu};
+    /* The daemon binds one target per configured powerModel entry, so the number of CPU
+     * clusters is not fixed: a two-cluster SoC (policy0 + policy6) has two, an sm8550 has
+     * three. Asking a cluster that does not exist makes the daemon reject the whole set,
+     * which is why a hardcoded {0, 1, 2} fails on a 2+6 device. */
+    if (nr_cpu < 0) nr_cpu = 0;
+    if (nr_cpu > 3) nr_cpu = 3;
+    gint clusters[4];
+    gint64 frequencies[4];
+    gint n = 0;
+    const gint64 cpus[3] = { prime, perf, eff };
+    for (gint i = 0; i < nr_cpu; i++) {
+        clusters[n] = i;
+        frequencies[n] = cpus[i];
+        n++;
+    }
+    clusters[n] = -1;          /* the GPU target */
+    frequencies[n] = gpu;
+    n++;
     gboolean success = TRUE;
-    for (guint i = 0; i < G_N_ELEMENTS(clusters); i++) {
+    for (gint i = 0; i < n; i++) {
         GVariant *ret = g_dbus_proxy_call_sync(
             proxy, "SetManualFreq",
             g_variant_new("(ix)", clusters[i], frequencies[i]),
@@ -317,7 +333,7 @@ gboolean dbus_proxy_apply_freq_override(DbusProxy *self,
             success = FALSE;
             /* Avoid leaving a partial set when a later policy rejects the
              * requested frequency. */
-            for (guint rollback = 0; rollback < i; rollback++) {
+            for (gint rollback = 0; rollback < i; rollback++) {
                 GVariant *released = g_dbus_proxy_call_sync(
                     proxy, "SetManualFreq",
                     g_variant_new("(ix)", clusters[rollback], (gint64)0),
@@ -335,5 +351,5 @@ gboolean dbus_proxy_apply_freq_override(DbusProxy *self,
 }
 
 gboolean dbus_proxy_release_freq_override(DbusProxy *self) {
-    return dbus_proxy_apply_freq_override(self, 0, 0, 0, 0);
+    return dbus_proxy_apply_freq_override(self, 0, 0, 0, 0, 0);
 }

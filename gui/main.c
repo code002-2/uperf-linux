@@ -148,14 +148,41 @@ static int build_freq_rows(FreqRow *rows, int max_rows) {
             continue;
         char base[256], path[320];
         g_snprintf(base, sizeof(base), "/sys/devices/system/cpu/cpufreq/%s", name);
-        g_snprintf(path, sizeof(path), "%s/cpuinfo_min_freq", base);
-        gdouble lo = read_sysfs_double(path);
-        g_snprintf(path, sizeof(path), "%s/cpuinfo_max_freq", base);
-        gdouble hi = read_sysfs_double(path);
+        /* Use the real operating points rather than cpuinfo_min/max_freq: the latter are
+         * the hardware limits, and the top one is not always a selectable bin (this
+         * device reports 4320 MHz for policy6 while the highest available is 4089.6 MHz).
+         * A slider that can reach an invalid value just gets snapped downward. */
+        g_snprintf(path, sizeof(path), "%s/scaling_available_frequencies", base);
+        char *list = NULL;
+        gdouble lo = -1.0, hi = -1.0;
+        if (g_file_get_contents(path, &list, NULL, NULL)) {
+            gchar **parts = g_strsplit_set(list, " \t\r\n", -1);
+            for (gint k = 0; parts[k]; k++) {
+                if (!*parts[k])
+                    continue;
+                gdouble v = g_ascii_strtod(parts[k], NULL);
+                if (v <= 0)
+                    continue;
+                if (lo < 0 || v < lo)
+                    lo = v;
+                if (hi < 0 || v > hi)
+                    hi = v;
+            }
+            g_strfreev(parts);
+            g_free(list);
+        }
+        if (lo <= 0 || hi <= 0) {
+            g_snprintf(path, sizeof(path), "%s/cpuinfo_min_freq", base);
+            lo = read_sysfs_double(path);
+            g_snprintf(path, sizeof(path), "%s/cpuinfo_max_freq", base);
+            hi = read_sysfs_double(path);
+        }
         if (lo <= 0 || hi <= 0)
             continue;
-        rows[n].min = lo / 1000.0;   /* kHz, which the override API wants */
-        rows[n].max = hi / 1000.0;
+        /* Both are in kHz, the unit the sliders use; the daemon wants Hz and
+         * on_apply_freq multiplies by 1000. */
+        rows[n].min = lo;
+        rows[n].max = hi;
         rows[n].def = rows[n].max;
         g_strlcpy(rows[n].unit, "kHz", sizeof(rows[n].unit));
         g_strlcpy(rows[n].title, name, sizeof(rows[n].title));
@@ -245,6 +272,8 @@ typedef struct {
     GtkAdjustment *freq_adj[4];
     GtkWidget    *freq_scale_rows[UPERF_MAX_CLUSTERS + 1];
     guint         nr_freq_rows;
+    guint         nr_cpu_rows;   /* CPU clusters, excluding the GPU row */
+    gboolean      has_gpu_row;
 
     /* Toasts */
     AdwToastOverlay *toasts;
@@ -445,13 +474,16 @@ static void on_apply_freq(GtkButton *btn, gpointer ud) {
         toast(tr("Override released"));
         return;
     }
-    /* CPU rows are in kHz (the daemon wants Hz); the GPU row is already Hz. */
-    guint n = g_app.nr_freq_rows;
-    gint64 prime = n > 0 ? (gint64)gtk_adjustment_get_value(g_app.freq_adj[0]) * 1000 : 0;
-    gint64 perf  = n > 1 ? (gint64)gtk_adjustment_get_value(g_app.freq_adj[1]) * 1000 : 0;
-    gint64 eff   = n > 2 ? (gint64)gtk_adjustment_get_value(g_app.freq_adj[2]) * 1000 : 0;
-    gint64 gpu   = n > 0 ? (gint64)gtk_adjustment_get_value(g_app.freq_adj[n - 1]) : 0;
-    if (dbus_proxy_apply_freq_override(g_app.proxy, prime, perf, eff, gpu))
+    /* CPU rows are in kHz (the daemon wants Hz); the GPU row is already Hz and must not
+     * be scaled. The last row is the GPU, so everything before it is a CPU cluster. */
+    guint nr_cpu = g_app.nr_cpu_rows;
+    gint64 c0 = nr_cpu > 0 ? (gint64)gtk_adjustment_get_value(g_app.freq_adj[0]) * 1000 : 0;
+    gint64 c1 = nr_cpu > 1 ? (gint64)gtk_adjustment_get_value(g_app.freq_adj[1]) * 1000 : 0;
+    gint64 c2 = nr_cpu > 2 ? (gint64)gtk_adjustment_get_value(g_app.freq_adj[2]) * 1000 : 0;
+    gint64 gpu = g_app.has_gpu_row
+                     ? (gint64)gtk_adjustment_get_value(g_app.freq_adj[nr_cpu])
+                     : 0;
+    if (dbus_proxy_apply_freq_override(g_app.proxy, (gint)nr_cpu, c0, c1, c2, gpu))
         toast(tr("Frequency override applied"));
     else {
         adw_switch_row_set_active(ADW_SWITCH_ROW(g_app.freq_toggle), FALSE);
@@ -725,6 +757,9 @@ static GtkWidget *create_frequency_page(void) {
         adw_preferences_group_add(ADW_PREFERENCES_GROUP(group), row);
     }
     g_app.nr_freq_rows = n_rows;
+    /* the GPU is the last row when present */
+    g_app.has_gpu_row = n_rows > 0 && g_strcmp0(cl[n_rows - 1].unit, "Hz") == 0;
+    g_app.nr_cpu_rows = g_app.has_gpu_row ? (guint)(n_rows - 1) : (guint)n_rows;
 
     /* Action buttons */
     GtkWidget *btns = adw_preferences_group_new();
