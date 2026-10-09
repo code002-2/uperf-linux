@@ -614,7 +614,8 @@ static const char *power_mode_to_string(PowerMode mode) {
 }
 
 static void apply_power_mode(PowerMode mode, const char *source) {
-    if (mode == MODE_FAST) mode = MODE_PERFORMANCE;
+    /* fast is a real preset with its own scheduler parameters; do not fold it into
+     * performance, which would make the two modes indistinguishable. */
     if (!g_sm || mode < 0 || mode >= MODE_NUM) return;
     if (state_machine_get_mode(g_sm) == mode) return;
     state_machine_set_mode(g_sm, mode);
@@ -634,6 +635,8 @@ static void dbus_mode_handler(const char *mode, void *ud) {
         power_mode = MODE_POWERSAVE;
     else if (strcmp(mode, "performance") == 0)
         power_mode = MODE_PERFORMANCE;
+    else if (strcmp(mode, "fast") == 0)
+        power_mode = MODE_FAST;
     else
         return;
     g_requested_mode = power_mode;
