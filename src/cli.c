@@ -129,7 +129,7 @@ static int cmd_status(void) {
 
 static int cmd_mode(const char *mode) {
     if (strcmp(mode, "balance") != 0 && strcmp(mode, "powersave") != 0 &&
-        strcmp(mode, "performance") != 0) {
+        strcmp(mode, "performance") != 0 && strcmp(mode, "fast") != 0) {
         fprintf(stderr, "Invalid mode: %s\n", mode);
         return 1;
     }

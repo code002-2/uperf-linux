@@ -340,7 +340,7 @@ static void dispatch_authorized_method(DbusManager *mgr,
         const char *mode = NULL;
         g_variant_get(parameters, "(&s)", &mode);
         if (strcmp(mode, "balance") != 0 && strcmp(mode, "powersave") != 0 &&
-            strcmp(mode, "performance") != 0) {
+            strcmp(mode, "performance") != 0 && strcmp(mode, "fast") != 0) {
             g_dbus_method_invocation_return_value(
                 invocation, g_variant_new("(b)", FALSE));
             return;
@@ -357,7 +357,8 @@ static void dispatch_authorized_method(DbusManager *mgr,
         gboolean valid = pid_in > 0 && app_in[0] != '\0' &&
             (strcmp(mode_in, "balance") == 0 ||
              strcmp(mode_in, "powersave") == 0 ||
-             strcmp(mode_in, "performance") == 0);
+             strcmp(mode_in, "performance") == 0 ||
+             strcmp(mode_in, "fast") == 0);
         if (!valid) {
             g_dbus_method_invocation_return_value(
                 invocation, g_variant_new("(b)", FALSE));

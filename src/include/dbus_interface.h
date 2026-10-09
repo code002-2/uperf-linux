@@ -40,7 +40,7 @@ void dbus_manager_set_authorize_handler(DbusManager *mgr,
                                         void *user_data);
 
 /* Update current power mode. Triggers ModeChanged signal.
- * mode: "balance", "powersave", or "performance" */
+ * mode: "balance", "powersave", "performance" or "fast" */
 void dbus_manager_set_mode(DbusManager *mgr, const char *mode);
 
 /* Update current scene state. Triggers SceneChanged signal.

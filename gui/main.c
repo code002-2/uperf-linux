@@ -3,6 +3,194 @@
 #include "dbus_proxy.h"
 
 /* ----------------------------------------------------------------
+ * Translation. English is the source language; Simplified Chinese is
+ * selected from the environment. A static table keeps the GUI free of
+ * gettext and the .mo files nothing else in this project uses.
+ * ---------------------------------------------------------------- */
+static const char *tr(const char *en) {
+    static const struct { const char *en, *zh; } tab[] = {
+        { "Prime",                  "超大核" },
+        { "Performance",            "性能核" },
+        { "Efficiency",             "能效核" },
+        { "GPU",                    "图形核心" },
+        { "Unknown",                "未知" },
+        { "Balance",                "均衡" },
+        { "Power Save",             "省电" },
+        { "Fast",                   "高性能" },
+        { "Normal",                 "正常" },
+        { "None",                   "无" },
+        { "Heavy load active",      "重负载运行中" },
+        { "Dashboard",              "总览" },
+        { "Power Mode",             "性能模式" },
+        { "Status",                 "状态" },
+        { "Active Mode",            "当前模式" },
+        { "Scene",                  "场景" },
+        { "Load State",             "负载状态" },
+        { "Scheduler",              "调度器" },
+        { "Thread affinity and cgroup management activity.",
+          "线程亲和性与 cgroup 管理活动。" },
+        { "Active Foreground PID",  "当前前台 PID" },
+        { "Managed Processes / Threads", "纳管进程 / 线程" },
+        { "Cluster Frequency",      "簇频率" },
+        { "CPU Utilization",        "CPU 占用率" },
+        { "Thermal",                "温度" },
+        { "Max Temperature",        "最高温度" },
+        { "Thermal State",          "温控状态" },
+        { "Failed to set power mode", "设置性能模式失败" },
+        { "Games",                  "游戏" },
+        { "Detected Games",         "已识别的游戏" },
+        { "Running game and game-like processes. Assign a per-app power mode.",
+          "正在运行的游戏类进程，可为每个应用单独指定性能模式。" },
+        { "No games detected",      "未检测到游戏" },
+        { "Launch a game and it will appear here.", "启动游戏后就会显示在这里。" },
+        { "Frequency",              "频率" },
+        { "Manual Frequency Override", "手动频率锁定" },
+        { "Lock each cluster to a fixed frequency. Disable to return to automatic scaling.",
+          "把每个簇锁定在固定频率。关闭后恢复自动调频。" },
+        { "Override Enabled",       "启用频率锁定" },
+        { "Apply",                  "应用" },
+        { "Release All",            "全部释放" },
+        { "Override released",      "已释放频率锁定" },
+        { "Frequency override applied", "频率锁定已应用" },
+        { "Failed to apply override", "应用频率锁定失败" },
+        { "Settings",               "设置" },
+        { "Daemon Configuration",   "守护进程配置" },
+        { "Edit the JSON with administrator privileges, then reload it here.",
+          "用管理员权限编辑 JSON 配置，然后在这里重新加载。" },
+        { "Reload",                 "重新加载" },
+        { "Configuration reloaded", "配置已重新加载" },
+        { "Reload failed",          "重新加载失败" },
+        { "Logs",                   "日志" },
+        { "Service Journal",        "服务日志" },
+        { "Press Refresh to load the latest uperf-linux.service journal.\n",
+          "点击「刷新」载入 uperf-linux.service 的最新日志。\n" },
+        { "Refresh",                "刷新" },
+        { "Clear",                  "清空" },
+        { "Unable to start journalctl", "无法启动 journalctl" },
+        { "Unable to read journal", "无法读取日志" },
+        { "(journal is empty)",     "（日志为空）" },
+    };
+    static int zh = -1;
+    if (zh < 0) {
+        const char *lang = g_getenv("LANGUAGE");
+        if (!lang || !*lang) lang = g_getenv("LC_ALL");
+        if (!lang || !*lang) lang = g_getenv("LC_MESSAGES");
+        if (!lang || !*lang) lang = g_getenv("LANG");
+        zh = (lang && g_str_has_prefix(lang, "zh")) ? 1 : 0;
+    }
+    if (!zh)
+        return en;
+    for (guint i = 0; i < G_N_ELEMENTS(tab); i++)
+        if (g_strcmp0(tab[i].en, en) == 0)
+            return tab[i].zh;
+    return en;
+}
+
+/* Power-mode names are their own vocabulary: "Performance" here means the
+ * performance preset, not the performance CPU cluster, so it must not share
+ * the cluster translations. */
+static const char *tr_mode(const char *mode) {
+    static const struct { const char *en, *zh; } tab[] = {
+        { "Balance",     "均衡模式" },
+        { "Power Save",  "省电模式" },
+        { "Performance", "高性能模式" },
+        { "Fast",        "疾速模式" },
+    };
+    const char *en = mode;
+    if (g_strcmp0(mode, "balance") == 0)          en = "Balance";
+    else if (g_strcmp0(mode, "powersave") == 0)   en = "Power Save";
+    else if (g_strcmp0(mode, "performance") == 0) en = "Performance";
+    else if (g_strcmp0(mode, "fast") == 0)        en = "Fast";
+    else return mode;
+
+    /* reuse the language decision from tr() by asking it about a known key */
+    if (g_strcmp0(tr("Balance"), "Balance") == 0)
+        return en;
+    for (guint i = 0; i < G_N_ELEMENTS(tab); i++)
+        if (g_strcmp0(tab[i].en, en) == 0)
+            return tab[i].zh;
+    return en;
+}
+
+
+/* ----------------------------------------------------------------
+ * Frequency rows. The ranges come from the hardware, so nothing is
+ * tied to a particular SoC: one row per cpufreq policy, ordered by
+ * descending maximum to match how the daemon publishes clusters
+ * (prime first, then performance, ...), plus the GPU devfreq.
+ * ---------------------------------------------------------------- */
+typedef struct {
+    char    title[64];
+    char    unit[8];
+    gdouble min, max, def;
+} FreqRow;
+
+static gdouble read_sysfs_double(const char *path) {
+    char *txt = NULL;
+    if (!g_file_get_contents(path, &txt, NULL, NULL))
+        return -1.0;
+    gdouble v = g_ascii_strtod(txt, NULL);
+    g_free(txt);
+    return v;
+}
+
+static int cmp_row_desc(gconstpointer a, gconstpointer b) {
+    const FreqRow *ra = a, *rb = b;
+    return (ra->max < rb->max) - (ra->max > rb->max);
+}
+
+static int build_freq_rows(FreqRow *rows, int max_rows) {
+    int n = 0;
+    GDir *d = g_dir_open("/sys/devices/system/cpu/cpufreq", 0, NULL);
+    const char *name;
+    while (d && (name = g_dir_read_name(d)) && n < max_rows - 1) {
+        if (!g_str_has_prefix(name, "policy"))
+            continue;
+        char base[256], path[320];
+        g_snprintf(base, sizeof(base), "/sys/devices/system/cpu/cpufreq/%s", name);
+        g_snprintf(path, sizeof(path), "%s/cpuinfo_min_freq", base);
+        gdouble lo = read_sysfs_double(path);
+        g_snprintf(path, sizeof(path), "%s/cpuinfo_max_freq", base);
+        gdouble hi = read_sysfs_double(path);
+        if (lo <= 0 || hi <= 0)
+            continue;
+        rows[n].min = lo / 1000.0;   /* kHz, which the override API wants */
+        rows[n].max = hi / 1000.0;
+        rows[n].def = rows[n].max;
+        g_strlcpy(rows[n].unit, "kHz", sizeof(rows[n].unit));
+        g_strlcpy(rows[n].title, name, sizeof(rows[n].title));
+        n++;
+    }
+    if (d)
+        g_dir_close(d);
+
+    if (n > 1)
+        qsort(rows, n, sizeof(FreqRow), cmp_row_desc);
+    for (int i = 0; i < n; i++) {
+        if (i == 0)
+            g_strlcpy(rows[i].title, "Prime", sizeof(rows[i].title));
+        else if (i == 1)
+            g_strlcpy(rows[i].title, "Performance", sizeof(rows[i].title));
+        else
+            g_snprintf(rows[i].title, sizeof(rows[i].title), "Efficiency %d", i - 1);
+    }
+
+    if (n < max_rows) {
+        gdouble lo = read_sysfs_double("/sys/class/devfreq/3d00000.gpu/min_freq");
+        gdouble hi = read_sysfs_double("/sys/class/devfreq/3d00000.gpu/max_freq");
+        if (lo > 0 && hi > 0) {
+            g_strlcpy(rows[n].title, "GPU", sizeof(rows[n].title));
+            g_strlcpy(rows[n].unit, "Hz", sizeof(rows[n].unit));
+            rows[n].min = lo;
+            rows[n].max = hi;
+            rows[n].def = hi;
+            n++;
+        }
+    }
+    return n;
+}
+
+/* ----------------------------------------------------------------
  * uperf-linux GUI — rebuilt around libadwaita idioms.
  *
  * Navigation:  AdwViewStack + AdwViewSwitcher (responsive, with a
@@ -55,7 +243,8 @@ typedef struct {
     /* Frequency override */
     GtkWidget    *freq_toggle;
     GtkAdjustment *freq_adj[4];
-    GtkWidget    *freq_scale_rows[4];
+    GtkWidget    *freq_scale_rows[UPERF_MAX_CLUSTERS + 1];
+    guint         nr_freq_rows;
 
     /* Toasts */
     AdwToastOverlay *toasts;
@@ -73,11 +262,11 @@ static void toast(const char *text) {
 }
 
 static const char *mode_display_name(const char *mode) {
-    if (!mode) return "Unknown";
-    if (!g_strcmp0(mode, "balance"))     return "Balance";
-    if (!g_strcmp0(mode, "powersave"))   return "Power Save";
-    if (!g_strcmp0(mode, "performance")) return "Performance";
-    if (!g_strcmp0(mode, "fast"))        return "Fast";
+    if (!mode) return tr("Unknown");
+    if (!g_strcmp0(mode, "balance"))     return tr_mode("balance");
+    if (!g_strcmp0(mode, "powersave"))   return tr_mode("powersave");
+    if (!g_strcmp0(mode, "performance")) return tr_mode("performance");
+    if (!g_strcmp0(mode, "fast"))        return tr_mode("fast");
     return mode;
 }
 
@@ -108,7 +297,7 @@ static void refresh_display(void) {
 
     if (g_app.row_heavy) {
         adw_action_row_set_subtitle(ADW_ACTION_ROW(g_app.row_heavy),
-            p->is_heavy_load ? "Heavy load active" : "Normal");
+            p->is_heavy_load ? tr("Heavy load active") : tr("Normal"));
         /* Recolor the row to signal state without a jumping label. */
         if (p->is_heavy_load)
             gtk_widget_add_css_class(g_app.row_heavy, "warning");
@@ -135,7 +324,7 @@ static void refresh_display(void) {
         if (p->active_pid > 0)
             g_snprintf(buf, sizeof(buf), "%d", p->active_pid);
         else
-            g_strlcpy(buf, "None", sizeof(buf));
+            g_strlcpy(buf, tr("None"), sizeof(buf));
         adw_action_row_set_subtitle(ADW_ACTION_ROW(g_app.row_active_pid), buf);
     }
     if (g_app.row_tracked) {
@@ -177,7 +366,7 @@ static void on_mode_toggled(GtkToggleButton *btn, gpointer ud) {
     if (!gtk_toggle_button_get_active(btn)) return;
     const char *mode = ud;
     if (g_app.proxy && !dbus_proxy_set_mode(g_app.proxy, mode))
-        toast("Failed to set power mode");
+        toast(tr("Failed to set power mode"));
 }
 
 /* Games: per-app mode dropdown */
@@ -210,16 +399,16 @@ static void on_refresh_logs(GtkButton *btn, gpointer ud) {
         G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_MERGE, &err,
         "journalctl", "-u", "uperf-linux.service", "-n", "200", "--no-pager", NULL);
     if (!proc) {
-        gtk_text_buffer_set_text(buf, err ? err->message : "Unable to start journalctl", -1);
+        gtk_text_buffer_set_text(buf, err ? err->message : tr("Unable to start journalctl"), -1);
         g_clear_error(&err);
         return;
     }
     gchar *out = NULL;
     if (!g_subprocess_communicate_utf8(proc, NULL, NULL, &out, NULL, &err)) {
-        gtk_text_buffer_set_text(buf, err ? err->message : "Unable to read journal", -1);
+        gtk_text_buffer_set_text(buf, err ? err->message : tr("Unable to read journal"), -1);
         g_clear_error(&err);
     } else {
-        gtk_text_buffer_set_text(buf, out && *out ? out : "(journal is empty)", -1);
+        gtk_text_buffer_set_text(buf, out && *out ? out : tr("(journal is empty)"), -1);
     }
     g_free(out);
     g_object_unref(proc);
@@ -234,16 +423,16 @@ static void on_clear_logs(GtkButton *btn, gpointer ud) {
 static void on_reload_config(GtkButton *btn, gpointer ud) {
     (void)btn; (void)ud;
     if (g_app.proxy && dbus_proxy_reload_config(g_app.proxy))
-        toast("Configuration reloaded");
+        toast(tr("Configuration reloaded"));
     else
-        toast("Reload failed");
+        toast(tr("Reload failed"));
 }
 
 /* Frequency override */
 static void on_freq_toggle(GObject *obj, GParamSpec *pspec, gpointer ud) {
     (void)pspec; (void)ud;
     gboolean on = adw_switch_row_get_active(ADW_SWITCH_ROW(obj));
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < UPERF_MAX_CLUSTERS + 1; i++)
         if (g_app.freq_scale_rows[i])
             gtk_widget_set_sensitive(g_app.freq_scale_rows[i], on);
 }
@@ -253,19 +442,20 @@ static void on_apply_freq(GtkButton *btn, gpointer ud) {
     if (!g_app.proxy || !g_app.freq_toggle) return;
     if (!adw_switch_row_get_active(ADW_SWITCH_ROW(g_app.freq_toggle))) {
         dbus_proxy_release_freq_override(g_app.proxy);
-        toast("Override released");
+        toast(tr("Override released"));
         return;
     }
-    /* CPU sliders are in kHz (daemon API wants Hz); GPU slider is already Hz. */
-    gint64 prime = (gint64)gtk_adjustment_get_value(g_app.freq_adj[0]) * 1000;
-    gint64 perf  = (gint64)gtk_adjustment_get_value(g_app.freq_adj[1]) * 1000;
-    gint64 eff   = (gint64)gtk_adjustment_get_value(g_app.freq_adj[2]) * 1000;
-    gint64 gpu   = (gint64)gtk_adjustment_get_value(g_app.freq_adj[3]);
+    /* CPU rows are in kHz (the daemon wants Hz); the GPU row is already Hz. */
+    guint n = g_app.nr_freq_rows;
+    gint64 prime = n > 0 ? (gint64)gtk_adjustment_get_value(g_app.freq_adj[0]) * 1000 : 0;
+    gint64 perf  = n > 1 ? (gint64)gtk_adjustment_get_value(g_app.freq_adj[1]) * 1000 : 0;
+    gint64 eff   = n > 2 ? (gint64)gtk_adjustment_get_value(g_app.freq_adj[2]) * 1000 : 0;
+    gint64 gpu   = n > 0 ? (gint64)gtk_adjustment_get_value(g_app.freq_adj[n - 1]) : 0;
     if (dbus_proxy_apply_freq_override(g_app.proxy, prime, perf, eff, gpu))
-        toast("Frequency override applied");
+        toast(tr("Frequency override applied"));
     else {
         adw_switch_row_set_active(ADW_SWITCH_ROW(g_app.freq_toggle), FALSE);
-        toast("Failed to apply override");
+        toast(tr("Failed to apply override"));
     }
 }
 
@@ -274,7 +464,7 @@ static void on_release_freq(GtkButton *btn, gpointer ud) {
     if (g_app.proxy) dbus_proxy_release_freq_override(g_app.proxy);
     if (g_app.freq_toggle)
         adw_switch_row_set_active(ADW_SWITCH_ROW(g_app.freq_toggle), FALSE);
-    toast("Override released");
+    toast(tr("Override released"));
 }
 
 /* ----------------------------------------------------------------
@@ -302,11 +492,11 @@ static GtkWidget *value_row(GtkWidget *group, const char *title) {
  * ---------------------------------------------------------------- */
 
 static GtkWidget *create_dashboard_page(void) {
-    GtkWidget *page = new_prefs_page("Dashboard", "speedometer-symbolic");
+    GtkWidget *page = new_prefs_page(tr("Dashboard"), "speedometer-symbolic");
 
     /* --- Power mode selector (linked toggle group) --- */
     GtkWidget *mode_group = adw_preferences_group_new();
-    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(mode_group), "Power Mode");
+    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(mode_group), tr("Power Mode"));
     adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
                              ADW_PREFERENCES_GROUP(mode_group));
 
@@ -319,7 +509,7 @@ static GtkWidget *create_dashboard_page(void) {
     static const char *labels[]  = { "Balance", "Power Save", "Performance", "Fast" };
     GtkWidget *first = NULL;
     for (int i = 0; i < 4; i++) {
-        GtkWidget *b = gtk_toggle_button_new_with_label(labels[i]);
+        GtkWidget *b = gtk_toggle_button_new_with_label(tr_mode(labels[i]));
         gtk_widget_set_hexpand(b, TRUE);
         if (first)
             gtk_toggle_button_set_group(GTK_TOGGLE_BUTTON(b), GTK_TOGGLE_BUTTON(first));
@@ -333,34 +523,34 @@ static GtkWidget *create_dashboard_page(void) {
 
     /* --- Status card --- */
     GtkWidget *status = adw_preferences_group_new();
-    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(status), "Status");
+    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(status), tr("Status"));
     adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
                              ADW_PREFERENCES_GROUP(status));
-    g_app.row_mode  = value_row(status, "Active Mode");
-    g_app.row_scene = value_row(status, "Scene");
-    g_app.row_heavy = value_row(status, "Load State");
+    g_app.row_mode  = value_row(status, tr("Active Mode"));
+    g_app.row_scene = value_row(status, tr("Scene"));
+    g_app.row_heavy = value_row(status, tr("Load State"));
 
     /* --- Scheduler card (affinity / cgroup activity) --- */
     GtkWidget *sched = adw_preferences_group_new();
-    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(sched), "Scheduler");
+    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(sched), tr("Scheduler"));
     adw_preferences_group_set_description(ADW_PREFERENCES_GROUP(sched),
-        "Thread affinity and cgroup management activity.");
+        tr("Thread affinity and cgroup management activity."));
     adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
                              ADW_PREFERENCES_GROUP(sched));
-    g_app.row_active_pid = value_row(sched, "Active Foreground PID");
-    g_app.row_tracked    = value_row(sched, "Managed Processes / Threads");
+    g_app.row_active_pid = value_row(sched, tr("Active Foreground PID"));
+    g_app.row_tracked    = value_row(sched, tr("Managed Processes / Threads"));
 
     /* --- Per-cluster frequency card --- */
     GtkWidget *freq = adw_preferences_group_new();
-    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(freq), "Cluster Frequency");
+    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(freq), tr("Cluster Frequency"));
     adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
                              ADW_PREFERENCES_GROUP(freq));
     for (int i = 0; i < 3; i++)
-        g_app.freq_rows[i] = value_row(freq, CLUSTER_NAMES[i]);
+        g_app.freq_rows[i] = value_row(freq, tr(CLUSTER_NAMES[i]));
 
     /* --- Per-CPU utilization card --- */
     GtkWidget *load = adw_preferences_group_new();
-    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(load), "CPU Utilization");
+    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(load), tr("CPU Utilization"));
     adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
                              ADW_PREFERENCES_GROUP(load));
     for (int i = 0; i < UPERF_MAX_CPUS; i++) {
@@ -371,11 +561,11 @@ static GtkWidget *create_dashboard_page(void) {
 
     /* --- Thermal card (with a real progress bar) --- */
     GtkWidget *therm = adw_preferences_group_new();
-    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(therm), "Thermal");
+    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(therm), tr("Thermal"));
     adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
                              ADW_PREFERENCES_GROUP(therm));
-    g_app.row_temp    = value_row(therm, "Max Temperature");
-    g_app.row_thermal = value_row(therm, "Thermal State");
+    g_app.row_temp    = value_row(therm, tr("Max Temperature"));
+    g_app.row_thermal = value_row(therm, tr("Thermal State"));
 
     g_app.temp_bar = gtk_progress_bar_new();
     gtk_widget_set_hexpand(g_app.temp_bar, TRUE);
@@ -463,22 +653,22 @@ static void refresh_games(void) {
 }
 
 static GtkWidget *create_games_page(void) {
-    GtkWidget *page = new_prefs_page("Games", "applications-games-symbolic");
+    GtkWidget *page = new_prefs_page(tr("Games"), "applications-games-symbolic");
 
     g_app.games_group = adw_preferences_group_new();
     adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(g_app.games_group),
-                                    "Detected Games");
+                                    tr("Detected Games"));
     adw_preferences_group_set_description(ADW_PREFERENCES_GROUP(g_app.games_group),
-        "Running game and game-like processes. Assign a per-app power mode.");
+        tr("Running game and game-like processes. Assign a per-app power mode."));
     adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
                              ADW_PREFERENCES_GROUP(g_app.games_group));
 
     /* Placeholder shown when nothing is detected. */
     g_app.games_placeholder = adw_action_row_new();
     adw_preferences_row_set_title(ADW_PREFERENCES_ROW(g_app.games_placeholder),
-                                  "No games detected");
+                                  tr("No games detected"));
     adw_action_row_set_subtitle(ADW_ACTION_ROW(g_app.games_placeholder),
-                                "Launch a game and it will appear here.");
+                                tr("Launch a game and it will appear here."));
     adw_preferences_group_add(ADW_PREFERENCES_GROUP(g_app.games_group),
                               g_app.games_placeholder);
 
@@ -490,41 +680,38 @@ static GtkWidget *create_games_page(void) {
  * ---------------------------------------------------------------- */
 
 static GtkWidget *create_frequency_page(void) {
-    GtkWidget *page = new_prefs_page("Frequency", "power-profile-performance-symbolic");
+    GtkWidget *page = new_prefs_page(tr("Frequency"), "power-profile-performance-symbolic");
 
     GtkWidget *group = adw_preferences_group_new();
     adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(group),
-                                    "Manual Frequency Override");
+                                    tr("Manual Frequency Override"));
     adw_preferences_group_set_description(ADW_PREFERENCES_GROUP(group),
-        "Lock each cluster to a fixed frequency. Disable to return to "
-        "automatic scaling.");
+        tr("Lock each cluster to a fixed frequency. Disable to return to automatic scaling."));
     adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
                              ADW_PREFERENCES_GROUP(group));
 
     /* Enable toggle */
     g_app.freq_toggle = adw_switch_row_new();
     adw_preferences_row_set_title(ADW_PREFERENCES_ROW(g_app.freq_toggle),
-                                  "Override Enabled");
+                                  tr("Override Enabled"));
     g_signal_connect(g_app.freq_toggle, "notify::active",
                      G_CALLBACK(on_freq_toggle), NULL);
     adw_preferences_group_add(ADW_PREFERENCES_GROUP(group), g_app.freq_toggle);
 
-    struct { const char *title; const char *unit; gdouble min, max, def; } cl[] = {
-        { "Prime",       "kHz", 595200,    2956800,   2956800   },
-        { "Performance", "kHz", 499200,    2803200,   2803200   },
-        { "Efficiency",  "kHz", 307200,    2016000,   2016000   },
-        { "GPU",         "Hz",  220000000, 680000000, 680000000 },
-    };
+    /* Ranges come from the hardware, not from a per-SoC table. */
+    FreqRow cl[UPERF_MAX_CLUSTERS + 1];
+    int n_rows = build_freq_rows(cl, G_N_ELEMENTS(cl));
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < n_rows; i++) {
         /* AdwActionRow holds the label; a scale sits in the row body below. */
         GtkWidget *row = adw_action_row_new();
-        char title[64];
-        g_snprintf(title, sizeof(title), "%s (%s)", cl[i].title, cl[i].unit);
+        char title[96];
+        g_snprintf(title, sizeof(title), "%s (%s)", tr(cl[i].title), cl[i].unit);
         adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), title);
 
+        gdouble step = g_strcmp0(cl[i].unit, "Hz") == 0 ? 1000000.0 : 50000.0;
         g_app.freq_adj[i] = gtk_adjustment_new(cl[i].def, cl[i].min, cl[i].max,
-                                               50000, 100000, 0);
+                                               step, step * 2, 0);
         GtkWidget *scale = gtk_scale_new(GTK_ORIENTATION_HORIZONTAL, g_app.freq_adj[i]);
         gtk_scale_set_draw_value(GTK_SCALE(scale), TRUE);
         gtk_scale_set_value_pos(GTK_SCALE(scale), GTK_POS_RIGHT);
@@ -537,6 +724,7 @@ static GtkWidget *create_frequency_page(void) {
         g_app.freq_scale_rows[i] = row;
         adw_preferences_group_add(ADW_PREFERENCES_GROUP(group), row);
     }
+    g_app.nr_freq_rows = n_rows;
 
     /* Action buttons */
     GtkWidget *btns = adw_preferences_group_new();
@@ -545,13 +733,13 @@ static GtkWidget *create_frequency_page(void) {
     GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_widget_set_halign(hbox, GTK_ALIGN_CENTER);
 
-    GtkWidget *apply = gtk_button_new_with_label("Apply");
+    GtkWidget *apply = gtk_button_new_with_label(tr("Apply"));
     gtk_widget_add_css_class(apply, "suggested-action");
     gtk_widget_add_css_class(apply, "pill");
     g_signal_connect(apply, "clicked", G_CALLBACK(on_apply_freq), NULL);
     gtk_box_append(GTK_BOX(hbox), apply);
 
-    GtkWidget *release = gtk_button_new_with_label("Release All");
+    GtkWidget *release = gtk_button_new_with_label(tr("Release All"));
     gtk_widget_add_css_class(release, "pill");
     g_signal_connect(release, "clicked", G_CALLBACK(on_release_freq), NULL);
     gtk_box_append(GTK_BOX(hbox), release);
@@ -565,11 +753,11 @@ static GtkWidget *create_frequency_page(void) {
  * ---------------------------------------------------------------- */
 
 static GtkWidget *create_settings_page(void) {
-    GtkWidget *page = new_prefs_page("Settings", "emblem-system-symbolic");
+    GtkWidget *page = new_prefs_page(tr("Settings"), "emblem-system-symbolic");
 
     GtkWidget *group = adw_preferences_group_new();
     adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(group),
-                                    "Daemon Configuration");
+                                    tr("Daemon Configuration"));
     adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
                              ADW_PREFERENCES_GROUP(group));
 
@@ -577,8 +765,8 @@ static GtkWidget *create_settings_page(void) {
     adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row),
                                   "/etc/uperf-linux/config.json");
     adw_action_row_set_subtitle(ADW_ACTION_ROW(row),
-        "Edit the JSON with administrator privileges, then reload it here.");
-    GtkWidget *reload = gtk_button_new_with_label("Reload");
+        tr("Edit the JSON with administrator privileges, then reload it here."));
+    GtkWidget *reload = gtk_button_new_with_label(tr("Reload"));
     gtk_widget_set_valign(reload, GTK_ALIGN_CENTER);
     g_signal_connect(reload, "clicked", G_CALLBACK(on_reload_config), NULL);
     adw_action_row_add_suffix(ADW_ACTION_ROW(row), reload);
@@ -592,10 +780,10 @@ static GtkWidget *create_settings_page(void) {
  * ---------------------------------------------------------------- */
 
 static GtkWidget *create_logs_page(void) {
-    GtkWidget *page = new_prefs_page("Logs", "text-x-generic-symbolic");
+    GtkWidget *page = new_prefs_page(tr("Logs"), "text-x-generic-symbolic");
 
     GtkWidget *group = adw_preferences_group_new();
-    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(group), "Service Journal");
+    adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(group), tr("Service Journal"));
     adw_preferences_page_add(ADW_PREFERENCES_PAGE(page),
                              ADW_PREFERENCES_GROUP(group));
 
@@ -607,7 +795,7 @@ static GtkWidget *create_logs_page(void) {
 
     GtkTextBuffer *buf = gtk_text_buffer_new(NULL);
     gtk_text_buffer_set_text(buf,
-        "Press Refresh to load the latest uperf-linux.service journal.\n", -1);
+        tr("Press Refresh to load the latest uperf-linux.service journal.\n"), -1);
     g_app.log_view = GTK_TEXT_VIEW(gtk_text_view_new_with_buffer(buf));
     gtk_text_view_set_editable(g_app.log_view, FALSE);
     gtk_text_view_set_monospace(g_app.log_view, TRUE);
@@ -623,11 +811,11 @@ static GtkWidget *create_logs_page(void) {
     GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_widget_set_halign(hbox, GTK_ALIGN_CENTER);
     gtk_widget_set_margin_top(hbox, 8);
-    GtkWidget *refresh = gtk_button_new_with_label("Refresh");
+    GtkWidget *refresh = gtk_button_new_with_label(tr("Refresh"));
     gtk_widget_add_css_class(refresh, "pill");
     g_signal_connect(refresh, "clicked", G_CALLBACK(on_refresh_logs), NULL);
     gtk_box_append(GTK_BOX(hbox), refresh);
-    GtkWidget *clear = gtk_button_new_with_label("Clear");
+    GtkWidget *clear = gtk_button_new_with_label(tr("Clear"));
     gtk_widget_add_css_class(clear, "pill");
     g_signal_connect(clear, "clicked", G_CALLBACK(on_clear_logs), NULL);
     gtk_box_append(GTK_BOX(hbox), clear);
@@ -652,11 +840,11 @@ static void on_activate(GtkApplication *app, gpointer ud) {
     GtkWidget *view_stack = adw_view_stack_new();
 
     struct { GtkWidget *(*build)(void); const char *name, *title, *icon; } pages[] = {
-        { create_dashboard_page, "dashboard", "Dashboard", "speedometer-symbolic" },
-        { create_games_page,     "games",     "Games",     "applications-games-symbolic" },
-        { create_frequency_page, "frequency", "Frequency", "power-profile-performance-symbolic" },
-        { create_settings_page,  "settings",  "Settings",  "emblem-system-symbolic" },
-        { create_logs_page,      "logs",      "Logs",      "text-x-generic-symbolic" },
+        { create_dashboard_page, "dashboard", tr("Dashboard"), "speedometer-symbolic" },
+        { create_games_page,     "games",     tr("Games"),     "applications-games-symbolic" },
+        { create_frequency_page, "frequency", tr("Frequency"), "power-profile-performance-symbolic" },
+        { create_settings_page,  "settings",  tr("Settings"),  "emblem-system-symbolic" },
+        { create_logs_page,      "logs",      tr("Logs"),      "text-x-generic-symbolic" },
     };
     for (int i = 0; i < 5; i++) {
         AdwViewStackPage *sp = adw_view_stack_add_titled(

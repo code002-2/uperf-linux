@@ -309,9 +309,13 @@ install(FILES
     config/dbus-interface.xml
     DESTINATION share/uperf-linux
 )
-install(FILES config/sm8550.json
+# This device's PowerModel. sm8550.json stays installed alongside it as a reference.
+install(FILES config/sm8750.json
     DESTINATION /etc/uperf-linux
     RENAME config.json
+)
+install(FILES config/sm8550.json
+    DESTINATION /etc/uperf-linux
 )
 install(FILES systemd/uperf-linux.service DESTINATION lib/systemd/system)
 install(FILES config/org.uperflinux.Daemon.conf
