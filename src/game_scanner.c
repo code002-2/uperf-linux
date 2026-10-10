@@ -15,12 +15,25 @@
 
 /* Known game patterns */
 static const char *DEFAULT_PATTERNS[] = {
+    /* Engine worker threads: their presence means a game is running even when
+     * the executable name says nothing useful. */
     "UnityMain", "GameThread", "RenderThread", "GLThread",
-    "dolphin", "ppsspp", "retroarch", "wine", "proton", "miHoYo",
-    "hoyoverse", "minecraft", "gameloft", "supercell", "niantic",
-    "rovio", "ea.games", "playdead", "half-life", "steam_app_",
+    "gamescope",
+
+    /* Steam and the layers that run its titles on this architecture. A game
+     * here is either a steam_app_<appid> wrapper or something executing under
+     * box64, FEX or Proton. */
+    "steam_app_", "steamwebhelper", "proton", "wine", "wineserver",
+    "box64", "box86", "FEXBash", "FEXInterpreter", "FEXCore",
+
+    /* Emulators */
+    "dolphin", "ppsspp", "retroarch", "yuzu", "ryujinx",
+
+    /* Commercial titles */
+    "miHoYo", "hoyoverse", "gameloft", "supercell", "niantic",
+    "rovio", "ea.games", "playdead", "epicgames", "riotgames",
     "gta", "pubg", "fortnite", "callofduty", "genshin", "honkai",
-    "arknights", "yuzu", "ryujinx",
+    "arknights", "minecraft",
     NULL
 };
 
@@ -138,6 +151,22 @@ int game_scanner_pattern_count(const GameScanner *gs) {
     return gs ? gs->nr_patterns : 0;
 }
 
+/* Kernel threads have no command line and are never games. Their comm can
+ * still collide with a pattern: "oom_reaper" contains "reaper", and several
+ * kworkers carry names built from the subsystems they drive. Treating one as a
+ * game pins the scheduler to the performance preset for as long as the thread
+ * lives, which on this device means it never leaves it. */
+static bool is_kernel_thread(pid_t pid, const char *cmdline) {
+    if (cmdline && cmdline[0] != '\0') return false;
+    char path[64];
+    char buf[64];
+    snprintf(path, sizeof(path), "/proc/%d/exe", pid);
+    ssize_t n = readlink(path, buf, sizeof(buf) - 1);
+    if (n < 0) return true;          /* no exe link means it is a kthread */
+    buf[n] = '\0';
+    return false;
+}
+
 int game_scanner_scan(GameScanner *gs) {
     if (!gs) return -1;
 
@@ -188,6 +217,8 @@ int game_scanner_scan(GameScanner *gs) {
         PowerMode configured_mode = MODE_BALANCE;
         bool configured = perapp_lookup_process(
             &gs->perapp, comm, cmdline, &configured_mode);
+        if (is_kernel_thread(pid, cmdline)) continue;
+
         if (matches_pattern(gs, comm) || command_matches ||
             (configured && configured_mode != MODE_BALANCE)) {
             uint64_t start_time = read_process_start_time(pid);

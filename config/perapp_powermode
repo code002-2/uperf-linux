@@ -1,33 +1,53 @@
 # Uperf-Linux per-application power mode mapping
 # Format: <process_pattern> <mode>   (space or colon separated)
-# Patterns are matched against /proc/[pid]/comm and /proc/[pid]/cmdline
+# Patterns are matched case-insensitively as substrings of /proc/[pid]/comm and
+# /proc/[pid]/cmdline.
 # Modes: balance, powersave, performance, fast
+#
+# ORDER MATTERS: the first matching rule wins, so a specific pattern has to be
+# listed before a broader one that also occurs inside it. "steam_app_730"
+# contains "steam", so any rule keyed on "steam" placed first would capture
+# every Steam game and hold it at balance.
 
-# Genshin Impact / Honkai: Star Rail (miHoYo/HoYoverse)
+# --- Steam titles and the layers that run them -----------------------------
+# These come first because they are the most specific: a Steam game is executed
+# as steam_app_<appid>, and on this architecture it runs under box64, FEX or
+# Proton. All of them are the heaviest workloads the device will see.
+steam_app_                      performance
+box64                           performance
+box86                           performance
+FEXBash                         performance
+FEXInterpreter                  performance
+FEXCore                         performance
+gamescope                       performance
+proton                          performance
+wineserver                      performance
+wine                            performance
+
+# --- Commercial titles -----------------------------------------------------
+com.tencent.tmgp.pubgmhd        performance
+com.activision.callofduty.shift performance
+com.epicgames                   performance
+com.riotgames                   performance
+com.gameloft                    performance
+com.supercell                   performance
 cn.hoyoverse                    performance
 com.miHoYo                      performance
-
-# PUBG Mobile
-com.tencent.tmgp.pubgmhd        performance
 com.pubg                        performance
+com.niantic                     performance
+com.rovio                       performance
 
-# Call of Duty Mobile
-com.activision.callofduty.shift performance
+# --- Emulators -------------------------------------------------------------
+retroarch                       performance
+dolphin                         performance
+ppsspp                          performance
+yuzu                            performance
+ryujinx                         performance
 
-# Minecraft
+# --- Deliberately not the top preset ---------------------------------------
+# The Steam client itself is a launcher and a browser; keeping it at balance
+# leaves the performance preset for the games it starts.
+steamwebhelper                  balance
+steam                           balance
 Minecraft                       balance
 com.mojang                      balance
-
-# Emulators
-retroarch                       balance
-dolphin                         balance
-ppsspp                          balance
-yuzu                            balance
-
-# Steam games (via Proton)
-steam                           balance
-proton                          balance
-wine                            balance
-
-# Default
-.*                              balance
