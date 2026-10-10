@@ -58,6 +58,9 @@ typedef struct {
     bool modified;
     bool automatic_disabled;
     bool valid;
+    /* Set when only the floor was raised, so releasing the game floor does not
+     * clobber a deliberate min/max pin from uperfctl set-freq. */
+    bool floor_only;
 } ManualFreqTarget;
 
 static ManualFreqTarget g_manual_cpu[MAX_CLUSTERS];
@@ -471,8 +474,33 @@ static gboolean restore_target(ManualFreqTarget *target) {
                                           maximum * target->unit_hz);
     if (result) {
         target->manual_active = false;
+    target->floor_only = false;
         target->modified = false;
         target->automatic_disabled = false;
+    }
+    return result;
+}
+
+/* Raise the floor of a target without pinning its ceiling.
+ *
+ * write_manual_target() sets min and max to the same value, which takes the
+ * governor out of the loop entirely. During a game that is the wrong shape:
+ * the GPU is idle between frames, and a governor that keeps its freedom drops
+ * down for those gaps and comes back up, which costs less power than holding
+ * the top bin the whole time. What hurts is the opposite case, where the
+ * governor lets the clock fall so far that the next frame stalls while it
+ * climbs back. Setting a floor and leaving the ceiling at the hardware maximum
+ * keeps the second from happening without giving up the first.
+ */
+static gboolean write_frequency_floor(ManualFreqTarget *target, gint64 floor_hz) {
+    if (!target || !target->valid) return FALSE;
+    if (floor_hz < target->hardware_min_hz || floor_hz > target->hardware_max_hz)
+        return FALSE;
+
+    gboolean result = write_target_limits(target, floor_hz, target->hardware_max_hz);
+    if (result) {
+        target->manual_active = true;
+        target->floor_only = true;
     }
     return result;
 }
@@ -489,7 +517,10 @@ static gboolean write_manual_target(ManualFreqTarget *target, gint64 freq_hz) {
         return FALSE;
     }
     gboolean result = write_target_limits(target, freq_hz, freq_hz);
-    if (result) target->manual_active = true;
+    if (result) {
+        target->manual_active = true;
+        target->floor_only = false;
+    }
     return result;
 }
 
@@ -701,6 +732,27 @@ static const char *power_mode_to_string(PowerMode mode) {
     }
 }
 
+/* The GPU floor used while a game is running.
+ *
+ * 600 MHz is far enough above the 160 MHz bottom of the table that the
+ * governor never has to climb out of the basement between frames, and far
+ * enough below the 1.1 GHz ceiling that it still has room to drop when the
+ * GPU really is idle. Pinning min and max together would be worse than
+ * useless here: it would hold the top bin through every idle gap. */
+#define GPU_GAME_FLOOR_HZ 600000000
+
+static void apply_gpu_game_floor(void) {
+    if (g_manual_gpu.valid && !g_manual_gpu.manual_active)
+        write_frequency_floor(&g_manual_gpu, GPU_GAME_FLOOR_HZ);
+}
+
+static void release_gpu_game_floor(void) {
+    /* Only undo the floor if nothing else pinned the GPU. A manual override
+     * from uperfctl set-freq owns the target and must not be disturbed. */
+    if (g_manual_gpu.valid && g_manual_gpu.floor_only)
+        restore_target(&g_manual_gpu);
+}
+
 static void apply_power_mode(PowerMode mode, const char *source) {
     if (!g_sm || mode < 0 || mode >= MODE_NUM) return;
 
@@ -719,6 +771,7 @@ static void apply_power_mode(PowerMode mode, const char *source) {
         fast_locked = FALSE;
         log_info("left fast: released the frequency pin and boost");
     }
+
     if (state_machine_get_mode(g_sm) == mode) return;
     state_machine_set_mode(g_sm, mode);
     if (g_dbus) dbus_manager_set_mode(g_dbus, power_mode_to_string(mode));
@@ -1124,6 +1177,17 @@ static int event_loop(void) {
                     if (strcmp(app_mode, "powersave") == 0)
                         detected_mode = MODE_POWERSAVE;
                 }
+                /* The GPU floor follows the game list rather than the power
+                 * mode. A mode can be set from several places and is sticky,
+                 * so keying the floor on it meant the floor outlived the game;
+                 * this runs on every scan and cannot get stuck. */
+                if (nr > 0) {
+                    apply_gpu_game_floor();
+                } else if (g_manual_gpu.floor_only) {
+                    release_gpu_game_floor();
+                    log_info("GPU game floor released");
+                }
+
                 if (detected_mode != g_last_detected_app_mode) {
                     g_last_detected_app_mode = detected_mode;
                     apply_power_mode(
