@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(uperf-linux VERSION 0.1.1 LANGUAGES C CXX)
+project(uperf-linux VERSION 0.1.2 LANGUAGES C CXX)
 
 # Make the version available to the sources so it is never hard coded.
 add_compile_definitions(UPERF_VERSION="${PROJECT_VERSION}")
