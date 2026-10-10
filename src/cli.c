@@ -22,7 +22,10 @@ static void print_usage(const char *prog) {
         "  game-list                      List detected game processes\n"
         "  active-pid <pid|0>             Select/clear the active workload\n"
         "  set-freq <cluster> <freq_hz>   Set/release a manual override\n"
-        "      cluster: -1=GPU, 0=Prime, 1=Perf, 2=Eff, 3=all CPUs\n"
+        "      cluster: -1 = GPU\n"
+        "               0..N-1 = CPU clusters, lowest index first\n"
+        "               N = every CPU cluster (N is the cluster count the\n"
+        "                   daemon reports, see show-freqs)\n"
         "      freq_hz: 0 releases the override\n"
         "  show-freqs                     Show frequencies reported by daemon\n"
         "  detect                         Run the hardware config wizard\n"
@@ -182,7 +185,10 @@ static int cmd_set_freq(const char *cluster_text, const char *freq_text) {
     char *end = NULL;
     errno = 0;
     long cluster = strtol(cluster_text, &end, 10);
-    if (errno || end == cluster_text || *end || cluster < -1 || cluster > 3) {
+    /* -1 is the GPU and any non-negative value is a cluster index, with the
+     * cluster count as the "all CPUs" selector. The daemon owns the real
+     * range, so this only rejects values that cannot mean anything. */
+    if (errno || end == cluster_text || *end || cluster < -1) {
         fprintf(stderr, "Invalid cluster: %s\n", cluster_text);
         return 1;
     }

@@ -577,11 +577,18 @@ static gboolean dbus_manual_freq_handler(int cluster, gint64 freq_hz,
                                           void *user_data) {
     (void)user_data;
     if (freq_hz < 0) return FALSE;
+
+    /* The cluster index space is: -1 for the GPU, 0..nr_cpu_targets-1 for the
+     * individual CPU clusters, and nr_cpu_targets for "every CPU cluster".
+     * The count comes from the loaded configuration, so a two-cluster part
+     * does not advertise or accept a third cluster index. */
+    const int all_cpus = g_nr_cpu_targets;
+
     if (cluster == -1)
         return write_manual_target(&g_manual_gpu, freq_hz);
-    if (cluster >= 0 && cluster < 3)
+    if (cluster >= 0 && cluster < all_cpus)
         return write_manual_target(&g_manual_cpu[cluster], freq_hz);
-    if (cluster == 3) {
+    if (cluster == all_cpus) {
         for (int i = 0; i < g_nr_cpu_targets; i++) {
             if (freq_hz != 0 &&
                 (freq_hz < g_manual_cpu[i].hardware_min_hz ||
