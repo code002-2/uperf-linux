@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(uperf-linux VERSION 0.1.0 LANGUAGES C CXX)
+project(uperf-linux VERSION 0.1.1 LANGUAGES C CXX)
 
 # This is a system daemon. Keep the default layout aligned with the Debian
 # package while still allowing an explicit prefix override.
