@@ -168,10 +168,31 @@ int thermal_manager_discover_zones(ThermalManager *tm) {
     return tm->nr_zones;
 }
 
+/* A zone is only trusted if it is one of the CPU, CPU-subsystem, GPU or
+ * SoC-package sensors. The device exposes 49 zones and several of them are
+ * either not temperature sensors in any useful sense or are still warming up,
+ * so folding them all into one maximum lets a single bad sample drive the
+ * whole policy. */
+static bool thermal_zone_is_trusted(const char *type) {
+    static const char *prefixes[] = {
+        "cpu", "cpuss", "gpuss", "soc", "gpu", "tsens", "cluster", "aoss",
+    };
+    if (!type || !type[0]) return false;
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        size_t n = strlen(prefixes[i]);
+        if (strncmp(type, prefixes[i], n) == 0) return true;
+    }
+    return false;
+}
+
 ThermalState thermal_manager_update(ThermalManager *tm) {
     if (!tm || tm->nr_zones == 0) return THERMAL_NORMAL;
 
-    tm->max_temp = 0;
+    int prev_max = tm->max_temp;
+    int max_trusted = 0;
+    int nr_used = 0;
+    int nr_rejected = 0;
+
     for (int i = 0; i < tm->nr_zones; i++) {
         ThermalZone *zone = &tm->zones[i];
 
@@ -184,10 +205,42 @@ ThermalState thermal_manager_update(ThermalManager *tm) {
             zone->temp_millidegC = atoi(temp_str);
         }
 
-        if (zone->temp_millidegC > tm->max_temp)
-            tm->max_temp = zone->temp_millidegC;
+        int t = zone->temp_millidegC;
 
+        /* Plausibility. A millidegree reading below zero or above 150 C is a
+         * sensor glitch, not a temperature this part can reach. */
+        if (t <= 0 || t >= 150000) {
+            nr_rejected++;
+            continue;
+        }
+
+        if (!thermal_zone_is_trusted(zone->type)) {
+            nr_rejected++;
+            continue;
+        }
+
+        /* A single sample that leaps more than 25 C away from the previous
+         * aggregate is discarded: real silicon does not move that fast between
+         * two polls, so it is a transient read rather than a real excursion.
+         * The first poll after start-up has no previous value and is accepted. */
+        if (prev_max > 0 && t > prev_max + 25000) {
+            nr_rejected++;
+            continue;
+        }
+
+        if (t > max_trusted) max_trusted = t;
+        nr_used++;
     }
+
+    if (nr_used > 0) {
+        tm->max_temp = max_trusted;
+    } else if (prev_max > 0) {
+        /* Everything was filtered out: keep the last good value rather than
+         * falling back to zero, which would look like a cool device. */
+        tm->max_temp = prev_max;
+    }
+    (void)nr_rejected;
+
 
     ThermalState proposed = thermal_policy_next_state(
         &tm->policy, tm->current_state, tm->max_temp);
@@ -359,12 +412,23 @@ const char *thermal_state_to_string(ThermalState state) {
 }
 
 ThermalPolicy thermal_default_policy(void) {
-    /* SM8550 / Snapdragon 8 Gen 2 typical thermal thresholds */
+    /* Defaults for SM8750 (Snapdragon 8 Elite), taken from the passive trip
+     * points the kernel registers for this SoC.
+     *
+     * The CPU package zones expose trip2 = 95 C (passive, 8 C hysteresis) and
+     * trip3 = 120 C (passive); hot and critical sit at 125 C. Every other zone
+     * (47 of them, GPU included) only publishes a 135 C placeholder.
+     *
+     * So 95 C is where the kernel itself starts pulling the frequency down, and
+     * the policy has to act before that rather than at 80 C: throttling at 80 C
+     * leaves the top ~40% of the frequency range unused on a part that is
+     * comfortable well above it. The recovery point keeps a 7 C gap so the
+     * state cannot oscillate across the boundary. */
     ThermalPolicy policy = {0};
-    policy.warn_temp       = 70000;   /* 70 C */
-    policy.throttle_temp   = 80000;   /* 80 C */
-    policy.critical_temp   = 95000;   /* 95 C */
-    policy.recovery_temp   = 75000;   /* 75 C */
+    policy.warn_temp       = 85000;   /* 85 C: just under the 95 C kernel trip */
+    policy.throttle_temp   = 95000;   /* 95 C: matches trip2, the real passive point */
+    policy.critical_temp   = 120000;  /* 120 C: matches trip3 */
+    policy.recovery_temp   = 88000;   /* 88 C: 7 C of hysteresis, no oscillation */
     return policy;
 }
 

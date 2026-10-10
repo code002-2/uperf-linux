@@ -764,9 +764,43 @@ static void print_usage(const char *prog) {
         prog);
 }
 
+/* Read the machine's own model name if the kernel exposes one, so the banner
+ * describes the device it is actually running on rather than a fixed part. */
+static const char *detect_platform(void) {
+    static char buf[128];
+    static int done = 0;
+    if (done) return buf;
+    done = 1;
+
+    const char *paths[] = {
+        "/sys/firmware/devicetree/base/model",
+        "/sys/devices/soc0/machine",
+        "/sys/class/dmi/id/product_name",
+    };
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        FILE *f = fopen(paths[i], "r");
+        if (!f) continue;
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        if (n > 0) {
+            buf[n] = '\0';
+            /* the devicetree model has a trailing NUL we just consumed */
+            while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\0')) buf[--n] = '\0';
+            if (n > 0) return buf;
+        }
+    }
+    snprintf(buf, sizeof(buf), "unknown platform");
+    return buf;
+}
+
 static void print_version(void) {
-    printf("uperf-linux v0.1.0\n");
-    printf("SM8550 (Snapdragon 8 Gen 2) performance scheduler\n");
+#ifdef UPERF_VERSION
+    printf("uperf-linux v%s\n", UPERF_VERSION);
+#else
+    printf("uperf-linux\n");
+#endif
+    printf("Qualcomm Snapdragon performance scheduler\n");
+    printf("Platform: %s\n", detect_platform());
     printf("Built: %s %s\n", __DATE__, __TIME__);
 }
 

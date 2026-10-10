@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(uperf-linux VERSION 0.1.1 LANGUAGES C CXX)
 
+# Make the version available to the sources so it is never hard coded.
+add_compile_definitions(UPERF_VERSION="${PROJECT_VERSION}")
+
 # This is a system daemon. Keep the default layout aligned with the Debian
 # package while still allowing an explicit prefix override.
 if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)

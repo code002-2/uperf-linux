@@ -107,7 +107,8 @@ int thermal_manager_find_zone_by_type(const ThermalManager *tm, ThermalZoneType 
 /* Get human-readable string for thermal state. */
 const char *thermal_state_to_string(ThermalState state);
 
-/* Get default thermal policy for SM8550 (Snapdragon 8 Gen 2). */
+/* Get the default thermal policy for SM8750 (Snapdragon 8 Elite),
+ * derived from the passive trip points the kernel registers. */
 ThermalPolicy thermal_default_policy(void);
 
 /* Get default thermal policy for general use (conservative). */

@@ -1,7 +1,7 @@
 {
   "meta": {
     "name": "sm8750 [piano / Xiaomi Pad 8 Pro]",
-    "author": "uperf-linux contributors, ported from sm8550"
+    "author": "uperf-linux contributors (SM8750 tuned against Xiaomi Pad 8 Pro hardware)"
   },
   "modules": {
     "switcher": {
@@ -35,20 +35,20 @@
           "nr": 2,
           "cpumask": "prime",
           "typicalPower": 1.4,
-          "typicalFreq": 4089,
-          "sweetFreq": 2841,
-          "plainFreq": 1958,
-          "freeFreq": 1017
+          "typicalFreq": 4089.6,
+          "sweetFreq": 2841.6,
+          "plainFreq": 1958.4,
+          "freeFreq": 1017.6
         },
         {
           "efficiency": 220,
           "nr": 6,
           "cpumask": "performance",
           "typicalPower": 0.9,
-          "typicalFreq": 3532,
-          "sweetFreq": 2227,
-          "plainFreq": 1555,
-          "freeFreq": 748
+          "typicalFreq": 3532.8,
+          "sweetFreq": 2841.6,
+          "plainFreq": 1555.2,
+          "freeFreq": 748.8
         }
       ]
     },
@@ -65,10 +65,10 @@
     },
     "thermal": {
       "enabled": true,
-      "warn_temp": 70000,
-      "throttle_temp": 80000,
-      "critical_temp": 95000,
-      "recovery_temp": 75000
+      "warn_temp": 85000,
+      "throttle_temp": 95000,
+      "critical_temp": 120000,
+      "recovery_temp": 88000
     },
     "sched": {
       "enable": true,
@@ -97,8 +97,7 @@
         ],
         "efficiency": [
           0,
-          1,
-          2
+          1
         ]
       },
       "affinity": {
@@ -324,9 +323,9 @@
     "balance": {
       "*": {
         "cpu.latencyTime": 0.2,
-        "cpu.slowLimitPower": 2.0,
-        "cpu.fastLimitPower": 2.0,
-        "cpu.fastLimitCapacity": 16.0,
+        "cpu.slowLimitPower": 4.0,
+        "cpu.fastLimitPower": 8.0,
+        "cpu.fastLimitCapacity": 20.0,
         "cpu.margin": 0.2
       },
       "idle": {
@@ -382,6 +381,24 @@
       }
     },
     "performance": {
+      "*": {
+        "cpu.latencyTime": 0.0,
+        "cpu.slowLimitPower": 999.0,
+        "cpu.fastLimitPower": 999.0,
+        "cpu.fastLimitCapacity": 999.0,
+        "cpu.margin": 0.4,
+        "cpu.burst": 0.2
+      },
+      "idle": {},
+      "touch": {
+        "cpu.margin": 0.4,
+        "cpu.latencyTime": 0.0
+      },
+      "switch": {
+        "cpu.burst": 0.2
+      }
+    },
+    "fast": {
       "*": {
         "cpu.latencyTime": 0.0,
         "cpu.slowLimitPower": 999.0,
